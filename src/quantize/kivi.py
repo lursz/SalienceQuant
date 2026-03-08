@@ -27,17 +27,14 @@ class KIVIQuantizedKVCache:
         self,
         bits: int = 2,
         residual_length: int = 128,
-        group_size: int = 32,
     ):
         """
         Args:
             bits: Quantization bit-width for the quantized portion.
             residual_length: Number of recent tokens to keep in FP16.
-            group_size: Group size for group quantization. If 0, no grouping.
         """
         self.bits = bits
         self.residual_length = residual_length
-        self.group_size = group_size
 
         # Per layer: (quantized_k, scale_k, quantized_v, scale_v, residual_k, residual_v)
         self._cache: dict[int, dict] = {}
@@ -114,11 +111,7 @@ class KIVIQuantizedKVCache:
         Quantizes along the seq_len dimension (dim=2), so each channel (head_dim)
         gets its own scale factor computed across all tokens.
         """
-        if self.group_size > 0:
-            return self._quantize_grouped(keys, per_channel=True)
-
         # Per-channel: scale computed across seq_len for each (batch, head, channel)
-        # dim=2 means we compute scale across the seq_len dimension
         return quantize_symmetric(keys, self.bits, dim=2)
 
     def _quantize_values(
@@ -129,49 +122,8 @@ class KIVIQuantizedKVCache:
         Quantizes along the head_dim dimension (dim=3), so each token gets its
         own scale factor computed across all channels.
         """
-        if self.group_size > 0:
-            return self._quantize_grouped(values, per_channel=False)
-
         # Per-token: scale computed across head_dim for each (batch, head, token)
-        # dim=3 means we compute scale across the head_dim dimension
         return quantize_symmetric(values, self.bits, dim=3)
-
-    def _quantize_grouped(
-        self, tensor: torch.Tensor, per_channel: bool
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Group quantization: split into groups along the quantization axis.
-
-        For Keys (per_channel=True): group along head_dim, quantize each group
-        across seq_len.
-        For Values (per_channel=False): group along head_dim, quantize each group
-        per token.
-        """
-        b, h, s, d = tensor.shape
-        g = self.group_size
-
-        if d % g != 0:
-            # Pad to group size
-            pad_size = g - (d % g)
-            tensor = torch.nn.functional.pad(tensor, (0, pad_size))
-            d = tensor.size(3)
-
-        num_groups = d // g
-        # Reshape: [b, h, s, num_groups, g]
-        tensor = tensor.view(b, h, s, num_groups, g)
-
-        if per_channel:
-            # Per-channel within each group: scale across seq_len
-            # dim=2 across seq_len
-            q, scale = quantize_symmetric(tensor, self.bits, dim=2)
-        else:
-            # Per-token within each group: scale across group elements
-            # dim=4 across group elements
-            q, scale = quantize_symmetric(tensor, self.bits, dim=4)
-
-        # Reshape back
-        q = q.view(b, h, s, -1)[:, :, :, :d]
-        # Keep scale in grouped shape for proper dequantization
-        return q, scale
 
     def get_kv(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Get full (dequantized + residual) KV states for a layer.

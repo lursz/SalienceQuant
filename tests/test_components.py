@@ -1,0 +1,278 @@
+"""Tests for all SalienceQuant components."""
+
+import torch
+import pytest
+
+
+# --- Quantization primitives ---
+
+class TestUniformQuantization:
+    def test_symmetric_roundtrip_8bit(self):
+        from src.quantize.uniform import quantize_symmetric, dequantize_symmetric
+        x = torch.randn(2, 4, 128, 64)
+        q, s = quantize_symmetric(x, bits=8, dim=-1)
+        x_hat = dequantize_symmetric(q, s)
+        assert x_hat.shape == x.shape
+        assert (x - x_hat).abs().mean() < 0.01
+
+    def test_symmetric_roundtrip_2bit(self):
+        from src.quantize.uniform import quantize_symmetric, dequantize_symmetric
+        x = torch.randn(2, 4, 128, 64)
+        q, s = quantize_symmetric(x, bits=2, dim=-1)
+        x_hat = dequantize_symmetric(q, s)
+        assert x_hat.shape == x.shape
+        # 2-bit has much larger error but should still reconstruct
+        assert (x - x_hat).abs().mean() < 1.0
+
+    def test_asymmetric_roundtrip(self):
+        from src.quantize.uniform import quantize_asymmetric, dequantize_asymmetric
+        x = torch.randn(2, 4, 128, 64) + 2.0  # shifted distribution
+        q, s, z = quantize_asymmetric(x, bits=8, dim=-1)
+        x_hat = dequantize_asymmetric(q, s, z)
+        assert x_hat.shape == x.shape
+        assert (x - x_hat).abs().mean() < 0.1
+
+
+class TestKIVIQuantization:
+    def test_basic_flow(self):
+        from src.quantize.kivi import KIVIQuantizedKVCache
+        cache = KIVIQuantizedKVCache(bits=4, residual_length=32)
+        k = torch.randn(1, 2, 128, 64)
+        v = torch.randn(1, 2, 128, 64)
+        cache.update(k, v, layer_idx=0)
+        k_out, v_out = cache.get_kv(0)
+        assert k_out.shape == k.shape
+        assert v_out.shape == v.shape
+
+    def test_residual_preserved(self):
+        from src.quantize.kivi import KIVIQuantizedKVCache
+        cache = KIVIQuantizedKVCache(bits=2, residual_length=32)
+        k = torch.randn(1, 2, 128, 64)
+        v = torch.randn(1, 2, 128, 64)
+        cache.update(k, v, layer_idx=0)
+        k_out, v_out = cache.get_kv(0)
+        # Last 32 tokens should be exact (FP16 residual)
+        assert torch.allclose(k[:, :, -32:, :], k_out[:, :, -32:, :], atol=1e-5)
+
+    def test_kivi_beats_uniform_on_values(self):
+        """KIVI's per-token V quantization should beat uniform's per-tensor."""
+        from src.quantize.kivi import KIVIQuantizedKVCache
+        from src.quantize.uniform import UniformQuantizedKVCache
+        k = torch.randn(1, 2, 512, 64)
+        v = torch.randn(1, 2, 512, 64)
+
+        # KIVI 2-bit
+        kivi = KIVIQuantizedKVCache(bits=2, residual_length=0)
+        kivi.update(k, v, layer_idx=0)
+        _, v_kivi = kivi.get_kv(0)
+        kivi_err = (v - v_kivi).abs().mean().item()
+
+        # Uniform 2-bit per-tensor
+        uniform = UniformQuantizedKVCache(bits=2, per_tensor=True)
+        uniform.quantize_and_store(k, v, layer_idx=0)
+        _, v_uni = uniform.dequantize(0)
+        uni_err = (v - v_uni).abs().mean().item()
+
+        assert kivi_err < uni_err, f"KIVI ({kivi_err}) should beat uniform ({uni_err})"
+
+
+# --- Scoring components ---
+
+class TestAttentionTracker:
+    def test_basic_tracking(self):
+        from src.scoring.attention_tracker import AttentionTracker
+        tracker = AttentionTracker(num_layers=2, num_kv_heads=2, alpha=0.3)
+
+        # Simulate attention weights: [batch=1, q_heads=4, q_len=1, kv_len=10]
+        attn = torch.softmax(torch.randn(1, 4, 1, 10), dim=-1)
+        tracker.update(layer_idx=0, attention_weights=attn, num_kv_groups=2)
+
+        importance = tracker.get_token_importance(0, aggregation="max")
+        assert importance.shape == (10,)
+        assert importance.sum() > 0
+
+    def test_ema_decay(self):
+        from src.scoring.attention_tracker import AttentionTracker
+        tracker = AttentionTracker(num_layers=1, num_kv_heads=1, alpha=0.5)
+
+        # First step: token 0 gets all attention
+        attn1 = torch.zeros(1, 1, 1, 5)
+        attn1[0, 0, 0, 0] = 1.0
+        tracker.update(0, attn1, num_kv_groups=1)
+
+        score_after_1 = tracker.get_token_importance(0).clone()
+        assert score_after_1[0] > score_after_1[1]
+
+        # Second step: token 4 gets all attention
+        attn2 = torch.zeros(1, 1, 1, 5)
+        attn2[0, 0, 0, 4] = 1.0
+        tracker.update(0, attn2, num_kv_groups=1)
+
+        score_after_2 = tracker.get_token_importance(0)
+        # Token 0 should have decayed, token 4 should have increased
+        assert score_after_2[0] < score_after_1[0]
+        assert score_after_2[4] > score_after_1[4]
+
+
+class TestImportanceScorer:
+    def test_value_importance_uses_attention(self):
+        from src.scoring.importance import ImportanceScorer
+        scorer = ImportanceScorer(num_layers=1, num_kv_heads=2, alpha=0.5)
+
+        attn = torch.softmax(torch.randn(1, 4, 1, 20), dim=-1)
+        scorer.update_attention(0, attn, num_kv_groups=2)
+
+        val_imp = scorer.get_value_importance(0)
+        assert val_imp.shape == (20,)
+
+    def test_key_importance_with_v_deviation(self):
+        from src.scoring.importance import ImportanceScorer
+        scorer = ImportanceScorer(num_layers=1, num_kv_heads=2, alpha=0.5)
+
+        batch, q_heads, kv_heads, seq_len, head_dim = 1, 4, 2, 20, 64
+        attn = torch.softmax(torch.randn(batch, q_heads, 1, seq_len), dim=-1)
+        Q = torch.randn(batch, q_heads, 1, head_dim)
+        V = torch.randn(batch, kv_heads, seq_len, head_dim)
+        output = torch.randn(batch, q_heads, 1, head_dim)
+
+        scorer.update_attention(0, attn, num_kv_groups=2)
+        scorer.update_key_importance(0, attn, Q, V, output, num_kv_groups=2)
+
+        key_imp = scorer.get_key_importance(0)
+        assert key_imp.shape == (20,)
+        assert key_imp.sum() > 0
+
+    def test_v_deviation_matters(self):
+        """Tokens with unusual Values should get higher Key importance."""
+        from src.scoring.importance import ImportanceScorer
+        scorer = ImportanceScorer(num_layers=1, num_kv_heads=1, alpha=1.0)
+
+        seq_len, head_dim = 10, 64
+        # Uniform attention
+        attn = torch.ones(1, 1, 1, seq_len) / seq_len
+
+        Q = torch.randn(1, 1, 1, head_dim)
+        V = torch.randn(1, 1, seq_len, head_dim) * 0.1  # small values
+        # Make token 5 have a very different value
+        V[0, 0, 5, :] = torch.randn(head_dim) * 10.0
+
+        output = (attn.unsqueeze(-1) * V.unsqueeze(2)).sum(dim=3).squeeze(3)
+        # output ≈ mean of V, which is dominated by the small values
+        # So V[5] - output is large
+
+        scorer.update_attention(0, attn, num_kv_groups=1)
+        scorer.update_key_importance(0, attn, Q, V, output, num_kv_groups=1)
+
+        key_imp = scorer.get_key_importance(0)
+        # Token 5 should have highest key importance due to V-deviation
+        assert key_imp[5] == key_imp.max(), (
+            f"Token 5 (unusual V) should be most important, got: {key_imp}"
+        )
+
+
+class TestSinkDetector:
+    def test_sink_mask(self):
+        from src.scoring.sink_detector import get_sink_mask
+        mask = get_sink_mask(100, num_sink_tokens=4)
+        assert mask[:4].all()
+        assert not mask[4:].any()
+
+    def test_protected_mask(self):
+        from src.scoring.sink_detector import get_protected_mask
+        mask = get_protected_mask(200, num_sink_tokens=4, recent_window=32)
+        assert mask[:4].all()      # sinks
+        assert mask[-32:].all()    # recent
+        assert not mask[50].item() # middle tokens not protected
+
+
+# --- Tiered quantization ---
+
+class TestTieredQuantizer:
+    def test_tier_assignment(self):
+        from src.quantize.tiered import assign_tiers, TierConfig, Tier
+        scores = torch.arange(100, dtype=torch.float)  # 0..99
+        protected = torch.zeros(100, dtype=torch.bool)
+        protected[:4] = True  # sinks
+
+        config = TierConfig(fp16_pct=0.10, int8_pct=0.20, int4_pct=0.30)
+        tiers = assign_tiers(scores, protected, config)
+
+        assert (tiers[:4] == Tier.FP16).all()  # sinks
+        # Highest scored non-protected tokens should be FP16/INT8
+        assert tiers[99] == Tier.FP16  # top token
+
+    def test_quantize_dequantize_roundtrip(self):
+        from src.quantize.tiered import TieredQuantizer, assign_tiers, TierConfig
+        k = torch.randn(1, 2, 100, 64)
+        v = torch.randn(1, 2, 100, 64)
+
+        scores = torch.rand(100)
+        protected = torch.zeros(100, dtype=torch.bool)
+        protected[:4] = True
+        protected[-16:] = True
+
+        tiers = assign_tiers(scores, protected, TierConfig())
+        quantizer = TieredQuantizer()
+        quantizer.quantize_and_store(k, v, tiers)
+        k_out, v_out = quantizer.dequantize()
+
+        assert k_out.shape == k.shape
+        assert v_out.shape == v.shape
+
+        # FP16 tokens should be exact
+        fp16_mask = tiers == 0
+        fp16_indices = fp16_mask.nonzero(as_tuple=True)[0]
+        if fp16_indices.numel() > 0:
+            assert torch.allclose(
+                k[:, :, fp16_indices, :], k_out[:, :, fp16_indices, :], atol=1e-5
+            )
+
+    def test_memory_savings(self):
+        from src.quantize.tiered import TieredQuantizer, assign_tiers, TierConfig
+        k = torch.randn(1, 2, 1000, 64)
+        v = torch.randn(1, 2, 1000, 64)
+
+        scores = torch.rand(1000)
+        protected = torch.zeros(1000, dtype=torch.bool)
+        protected[:4] = True
+        protected[-32:] = True
+
+        tiers = assign_tiers(scores, protected, TierConfig())
+        quantizer = TieredQuantizer()
+        quantizer.quantize_and_store(k, v, tiers)
+
+        mem = quantizer.memory_bytes()
+        fp16_full = k.nelement() * 2 + v.nelement() * 2  # 2 bytes per FP16
+        # Tiered should use less memory than full FP16
+        assert mem["total"] < fp16_full
+
+
+# --- SalienceCache integration ---
+
+class TestSalienceCache:
+    def test_basic_flow(self):
+        from src.cache.salience_cache import SalienceCache
+        cache = SalienceCache(
+            num_layers=2,
+            num_kv_heads=2,
+            num_attention_heads=4,
+            num_sink_tokens=2,
+            recent_window=8,
+            rescore_interval=1,  # re-score every step for testing
+        )
+
+        batch, kv_heads, q_heads, seq_len, head_dim = 1, 2, 4, 64, 32
+
+        for layer_idx in range(2):
+            k = torch.randn(batch, kv_heads, seq_len, head_dim)
+            v = torch.randn(batch, kv_heads, seq_len, head_dim)
+            attn = torch.softmax(torch.randn(batch, q_heads, 1, seq_len), dim=-1)
+            Q = torch.randn(batch, q_heads, 1, head_dim)
+            output = torch.randn(batch, q_heads, 1, head_dim)
+
+            cache.update(layer_idx, k, v, attn, Q, output)
+
+        # Should be able to retrieve KV
+        k_out, v_out = cache.get_kv(0)
+        assert k_out.shape[2] == seq_len
+        assert v_out.shape[2] == seq_len
