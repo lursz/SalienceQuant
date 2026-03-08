@@ -276,3 +276,158 @@ class TestSalienceCache:
         k_out, v_out = cache.get_kv(0)
         assert k_out.shape[2] == seq_len
         assert v_out.shape[2] == seq_len
+
+    def test_with_per_layer_configs(self):
+        """Test SalienceCache with per-layer tier configs from budget optimizer."""
+        from src.cache.salience_cache import SalienceCache
+        from src.quantize.tiered import TierConfig
+        from src.budget import optimize_tier_configs
+
+        num_layers = 4
+        # Fake sensitivity: layers 0 and 3 are most sensitive
+        sensitivity = {0: 1.0, 1: 0.2, 2: 0.3, 3: 0.9}
+        per_layer_configs = optimize_tier_configs(num_layers, sensitivity, target_avg_bits=4.0)
+
+        cache = SalienceCache(
+            num_layers=num_layers,
+            num_kv_heads=2,
+            num_attention_heads=4,
+            num_sink_tokens=2,
+            recent_window=8,
+            rescore_interval=1,
+            per_layer_tier_configs=per_layer_configs,
+        )
+
+        batch, kv_heads, q_heads, seq_len, head_dim = 1, 2, 4, 64, 32
+        for layer_idx in range(num_layers):
+            k = torch.randn(batch, kv_heads, seq_len, head_dim)
+            v = torch.randn(batch, kv_heads, seq_len, head_dim)
+            attn = torch.softmax(torch.randn(batch, q_heads, 1, seq_len), dim=-1)
+            Q = torch.randn(batch, q_heads, 1, head_dim)
+            output = torch.randn(batch, q_heads, 1, head_dim)
+            cache.update(layer_idx, k, v, attn, Q, output)
+
+        for layer_idx in range(num_layers):
+            k_out, v_out = cache.get_kv(layer_idx)
+            assert k_out.shape[2] == seq_len
+
+    def test_with_fisher_weights(self):
+        """Test SalienceCache with Fisher channel weights."""
+        from src.cache.salience_cache import SalienceCache
+        from src.scoring.fisher import FisherChannelWeights
+
+        num_layers, num_kv_heads, head_dim = 2, 2, 32
+
+        # Create fake Fisher data
+        fisher_data = {
+            i: {
+                "key_fisher": torch.rand(num_kv_heads, head_dim),
+                "value_fisher": torch.rand(num_kv_heads, head_dim),
+            }
+            for i in range(num_layers)
+        }
+        fisher = FisherChannelWeights(fisher_data)
+
+        cache = SalienceCache(
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            num_attention_heads=4,
+            num_sink_tokens=2,
+            recent_window=8,
+            rescore_interval=1,
+            fisher_weights=fisher,
+        )
+
+        batch, q_heads, seq_len = 1, 4, 64
+        for layer_idx in range(num_layers):
+            k = torch.randn(batch, num_kv_heads, seq_len, head_dim)
+            v = torch.randn(batch, num_kv_heads, seq_len, head_dim)
+            attn = torch.softmax(torch.randn(batch, q_heads, 1, seq_len), dim=-1)
+            Q = torch.randn(batch, q_heads, 1, head_dim)
+            output = torch.randn(batch, q_heads, 1, head_dim)
+            cache.update(layer_idx, k, v, attn, Q, output)
+
+        k_out, v_out = cache.get_kv(0)
+        assert k_out.shape[2] == seq_len
+
+
+# --- Budget optimizer ---
+
+class TestBudget:
+    def test_layer_bit_budget(self):
+        from src.budget import compute_layer_bit_budget
+        sensitivity = {0: 1.0, 1: 0.1, 2: 0.5, 3: 0.8}
+        bits = compute_layer_bit_budget(4, sensitivity, target_avg_bits=4.0)
+
+        assert len(bits) == 4
+        # Most sensitive layer should get most bits
+        assert bits[0] > bits[1]
+        # Average should be close to target
+        avg = sum(bits.values()) / len(bits)
+        assert abs(avg - 4.0) < 0.5
+
+    def test_bits_to_tier_config(self):
+        from src.budget import bits_to_tier_config
+        # At 2 bits: almost all INT2
+        config_2 = bits_to_tier_config(2.0)
+        assert config_2.int2_pct > 0.9
+
+        # At 8 bits: significant FP16/INT8
+        config_8 = bits_to_tier_config(8.0)
+        assert config_8.fp16_pct > config_2.fp16_pct
+
+    def test_optimize_tier_configs(self):
+        from src.budget import optimize_tier_configs
+        from src.quantize.tiered import TierConfig
+        sensitivity = {0: 1.0, 1: 0.1, 2: 0.3, 3: 0.7}
+        configs = optimize_tier_configs(4, sensitivity, target_avg_bits=4.0)
+
+        assert len(configs) == 4
+        for idx, config in configs.items():
+            assert isinstance(config, TierConfig)
+            total = config.fp16_pct + config.int8_pct + config.int4_pct + config.int2_pct
+            assert abs(total - 1.0) < 0.01
+
+    def test_sensitive_layers_get_more_fp16(self):
+        from src.budget import optimize_tier_configs
+        sensitivity = {0: 1.0, 1: 0.01}
+        configs = optimize_tier_configs(2, sensitivity, target_avg_bits=4.0)
+        # Layer 0 (sensitive) should have more FP16 than layer 1
+        assert configs[0].fp16_pct >= configs[1].fp16_pct
+
+
+# --- Fisher weights ---
+
+class TestFisherWeights:
+    def test_channel_weights_normalized(self):
+        from src.scoring.fisher import FisherChannelWeights
+        data = {
+            0: {
+                "key_fisher": torch.tensor([[1.0, 5.0, 3.0, 2.0]]),
+                "value_fisher": torch.tensor([[0.5, 1.0, 0.8, 0.3]]),
+            }
+        }
+        fw = FisherChannelWeights(data)
+        weights = fw.get_channel_weights(0, "key")
+        assert weights.min() >= 0.0
+        assert weights.max() <= 1.0
+        # Channel 1 (value=5.0) should have highest weight
+        assert weights[0, 1] == 1.0
+
+    def test_save_load(self, tmp_path):
+        from src.scoring.fisher import FisherChannelWeights
+        data = {
+            0: {
+                "key_fisher": torch.rand(2, 64),
+                "value_fisher": torch.rand(2, 64),
+            }
+        }
+        fw = FisherChannelWeights(data)
+        path = str(tmp_path / "fisher.pt")
+        fw.save(path)
+
+        fw2 = FisherChannelWeights.load(path)
+        assert torch.allclose(
+            fw2.get_channel_weights(0, "key"),
+            fw.get_channel_weights(0, "key"),
+        )
