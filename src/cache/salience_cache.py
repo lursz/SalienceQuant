@@ -10,8 +10,9 @@ Combines all components:
 import torch
 
 from src.scoring.importance import ImportanceScorer
+from src.scoring.fisher import FisherChannelWeights
 from src.scoring.sink_detector import get_protected_mask
-from src.quantize.tiered import TieredQuantizer, TierConfig, assign_tiers
+from src.quantize.tiered import Tier, TieredQuantizer, TierConfig, assign_tiers
 
 
 class SalienceCache:
@@ -41,6 +42,8 @@ class SalienceCache:
         recent_window: int = 128,
         rescore_interval: int = 16,
         tier_config: TierConfig | None = None,
+        per_layer_tier_configs: dict[int, TierConfig] | None = None,
+        fisher_weights: FisherChannelWeights | None = None,
     ):
         """
         Args:
@@ -51,7 +54,11 @@ class SalienceCache:
             num_sink_tokens: Number of initial tokens always kept in FP16.
             recent_window: Number of recent tokens kept in FP16.
             rescore_interval: Re-score and re-assign tiers every N steps.
-            tier_config: Configuration for tier percentages. None = default.
+            tier_config: Default tier percentages (used when per_layer not set).
+            per_layer_tier_configs: Per-layer tier configs from budget optimizer.
+                Overrides tier_config for layers that have an entry.
+            fisher_weights: Offline Fisher channel weights. If provided,
+                used to weight importance scores by channel sensitivity.
         """
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -60,6 +67,8 @@ class SalienceCache:
         self.recent_window = recent_window
         self.rescore_interval = rescore_interval
         self.tier_config = tier_config or TierConfig()
+        self.per_layer_tier_configs = per_layer_tier_configs or {}
+        self.fisher_weights = fisher_weights
 
         self.scorer = ImportanceScorer(num_layers, num_kv_heads, alpha)
 
@@ -153,6 +162,10 @@ class SalienceCache:
 
             self._quantize_layer(layer_idx)
 
+    def _get_tier_config(self, layer_idx: int) -> TierConfig:
+        """Get the tier config for a layer (per-layer override or default)."""
+        return self.per_layer_tier_configs.get(layer_idx, self.tier_config)
+
     def _quantize_layer(self, layer_idx: int):
         """Quantize a single layer based on current importance scores."""
         keys = self._full_keys[layer_idx]
@@ -167,8 +180,6 @@ class SalienceCache:
         device = keys.device
 
         # Get importance scores
-        # Use Key importance for Key tier assignment, Value importance for Value
-        # For simplicity in v1, use the max of both for unified tier assignment
         key_imp = self.scorer.get_key_importance(layer_idx)
         val_imp = self.scorer.get_value_importance(layer_idx)
 
@@ -183,6 +194,17 @@ class SalienceCache:
         key_imp = key_imp[:seq_len]
         val_imp = val_imp[:seq_len]
 
+        # If Fisher weights available, scale importance by channel sensitivity
+        # We use the mean Fisher weight across channels as a layer-level scaling factor
+        if self.fisher_weights is not None:
+            key_channel_weights = self.fisher_weights.get_channel_weights(layer_idx, "key")
+            val_channel_weights = self.fisher_weights.get_channel_weights(layer_idx, "value")
+            # Mean Fisher across channels as a scalar layer-level weight
+            key_fisher_scale = key_channel_weights.mean().item()
+            val_fisher_scale = val_channel_weights.mean().item()
+            key_imp = key_imp * key_fisher_scale
+            val_imp = val_imp * val_fisher_scale
+
         # Combined importance (max of key and value importance)
         combined_imp = torch.max(key_imp, val_imp)
 
@@ -191,8 +213,9 @@ class SalienceCache:
             seq_len, self.num_sink_tokens, self.recent_window, device
         )
 
-        # Assign tiers
-        tiers = assign_tiers(combined_imp, protected, self.tier_config)
+        # Assign tiers using per-layer config
+        tier_config = self._get_tier_config(layer_idx)
+        tiers = assign_tiers(combined_imp, protected, tier_config)
         self._tier_assignments[layer_idx] = tiers
 
         # Quantize
@@ -202,8 +225,7 @@ class SalienceCache:
         self._is_quantized[layer_idx] = True
 
         # Free full-precision storage (quantizer owns the data now)
-        # Keep a reference for shape info only
-        self._full_keys[layer_idx] = keys[:, :, :0, :]  # empty tensor with right shape
+        self._full_keys[layer_idx] = keys[:, :, :0, :]
         self._full_values[layer_idx] = values[:, :, :0, :]
 
     def get_kv(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -238,7 +260,7 @@ class SalienceCache:
         """Detailed memory breakdown."""
         total_quantized = 0
         total_full = 0
-        tier_counts = {t.name: 0 for t in Tier.__class__}
+        tier_counts = {t.name: 0 for t in Tier}
 
         for layer_idx in self._full_keys:
             if self._is_quantized.get(layer_idx, False):
