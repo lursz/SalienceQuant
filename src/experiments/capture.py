@@ -42,7 +42,7 @@ def capture_states(
     Returns:
         CapturedStates with all per-layer states.
     """
-    if device is None:
+    if device is None or device == "auto":
         device = next(model.parameters()).device
 
     num_layers = model.config.num_hidden_layers
@@ -106,8 +106,13 @@ def capture_states(
         # Extract KV from the cache
         past_kv = outputs.past_key_values
         for layer_idx in range(num_layers):
-            if hasattr(past_kv, 'key_cache'):
-                # DynamicCache format
+            if hasattr(past_kv, 'layers'):
+                # New DynamicCache format (transformers >= 4.x): layers list of DynamicLayer
+                layer_cache = past_kv.layers[layer_idx]
+                captured_keys[layer_idx] = layer_cache.keys.detach().cpu()
+                captured_values[layer_idx] = layer_cache.values.detach().cpu()
+            elif hasattr(past_kv, 'key_cache'):
+                # Older DynamicCache format
                 captured_keys[layer_idx] = past_kv.key_cache[layer_idx].detach().cpu()
                 captured_values[layer_idx] = past_kv.value_cache[layer_idx].detach().cpu()
             elif isinstance(past_kv, (list, tuple)):
