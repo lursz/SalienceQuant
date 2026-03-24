@@ -1,9 +1,7 @@
 """Perplexity evaluation with quantized KV cache replacement.
 
-Hooks into the model to replace FP16 KV states with quantized versions
-during the forward pass, measuring the actual perplexity impact.
-
-This gives a more realistic metric than reconstruction error alone.
+Hooks into k_proj and v_proj to quantize K and V tensors before they
+participate in attention, accurately simulating KV cache quantization.
 """
 
 import torch
@@ -13,9 +11,33 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.eval import load_wikitext2
 from src.quantize.uniform import quantize_symmetric, dequantize_symmetric
-from src.quantize.kivi import KIVIQuantizedKVCache
 from src.quantize.tiered import TierConfig
-from src.cache.salience_cache import SalienceCache
+
+
+def _get_kv_config(model: AutoModelForCausalLM) -> tuple[int, int]:
+    config = model.config
+    num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+    head_dim = config.hidden_size // config.num_attention_heads
+    return num_kv_heads, head_dim
+
+
+def _make_proj_quant_hook(bits: int, num_kv_heads: int, head_dim: int, quant_dim: int):
+    """Hook for k_proj/v_proj output.
+
+    Reshapes [batch, seq, kv_heads*head_dim] → [batch, kv_heads, seq, head_dim],
+    quantizes along quant_dim, then reshapes back.
+
+    quant_dim=2  → per-channel K  (scale per head_dim channel, shared over seq)
+    quant_dim=-1 → per-token  V  (scale per token, shared over head_dim)
+    """
+    def hook_fn(module, args, output):
+        batch, seq_len, _ = output.shape
+        out = output.view(batch, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+        # out: [batch, num_kv_heads, seq_len, head_dim]
+        q, s = quantize_symmetric(out, bits=bits, dim=quant_dim)
+        dequant = dequantize_symmetric(q, s).to(output.dtype)
+        return dequant.transpose(1, 2).contiguous().view(batch, seq_len, num_kv_heads * head_dim)
+    return hook_fn
 
 
 def evaluate_ppl_with_uniform_quant(
@@ -28,38 +50,26 @@ def evaluate_ppl_with_uniform_quant(
 ) -> dict:
     """Evaluate perplexity with uniform KV cache quantization.
 
-    Hooks into each attention layer to quantize/dequantize the attention output,
-    simulating the effect of KV cache quantization on model accuracy.
+    Quantizes both K and V with per-token symmetric quantization (dim=-1).
     """
     if device is None:
         device = next(model.parameters()).device
+    num_kv_heads, head_dim = _get_kv_config(model)
+    handles = []
 
-    num_layers = model.config.num_hidden_layers
-    hook_handles = []
-
-    def make_quant_hook(bits):
-        def hook_fn(module, args, kwargs, output):
-            if isinstance(output, tuple):
-                attn_out = output[0]
-                q, s = quantize_symmetric(attn_out, bits=bits, dim=-1)
-                attn_out_q = dequantize_symmetric(q, s).to(attn_out.dtype)
-                return (attn_out_q,) + output[1:]
-            return output
-        return hook_fn
-
-    # Register hooks on all layers
-    for layer_idx in range(num_layers):
-        layer = model.model.layers[layer_idx]
-        h = layer.self_attn.register_forward_hook(
-            make_quant_hook(bits), with_kwargs=True
-        )
-        hook_handles.append(h)
+    for layer in model.model.layers:
+        handles.append(layer.self_attn.k_proj.register_forward_hook(
+            _make_proj_quant_hook(bits, num_kv_heads, head_dim, quant_dim=-1)
+        ))
+        handles.append(layer.self_attn.v_proj.register_forward_hook(
+            _make_proj_quant_hook(bits, num_kv_heads, head_dim, quant_dim=-1)
+        ))
 
     try:
         result = _evaluate_ppl_core(model, tokenizer, seq_len, max_samples, device)
         result["method"] = f"Uniform INT{bits}"
     finally:
-        for h in hook_handles:
+        for h in handles:
             h.remove()
 
     return result
@@ -75,38 +85,29 @@ def evaluate_ppl_with_kivi_quant(
 ) -> dict:
     """Evaluate perplexity with KIVI-style KV cache quantization.
 
-    Simulates KIVI by quantizing attention outputs with per-channel granularity
-    for the key-like component and per-token for value-like component.
+    K: per-channel quantization (scale per head_dim channel, shared over seq_len).
+    V: per-token quantization (scale per token, shared over head_dim).
     """
     if device is None:
         device = next(model.parameters()).device
+    num_kv_heads, head_dim = _get_kv_config(model)
+    handles = []
 
-    num_layers = model.config.num_hidden_layers
-    hook_handles = []
-
-    def make_kivi_hook(bits):
-        def hook_fn(module, args, kwargs, output):
-            if isinstance(output, tuple):
-                attn_out = output[0]
-                # Per-channel quantization (simulate key-style)
-                q, s = quantize_symmetric(attn_out, bits=bits, dim=2)
-                attn_out_q = dequantize_symmetric(q, s).to(attn_out.dtype)
-                return (attn_out_q,) + output[1:]
-            return output
-        return hook_fn
-
-    for layer_idx in range(num_layers):
-        layer = model.model.layers[layer_idx]
-        h = layer.self_attn.register_forward_hook(
-            make_kivi_hook(bits), with_kwargs=True
-        )
-        hook_handles.append(h)
+    for layer in model.model.layers:
+        # K: per-channel — amax over dim=2 (seq_len) → scale [batch, heads, 1, head_dim]
+        handles.append(layer.self_attn.k_proj.register_forward_hook(
+            _make_proj_quant_hook(bits, num_kv_heads, head_dim, quant_dim=2)
+        ))
+        # V: per-token — amax over dim=-1 (head_dim) → scale [batch, heads, seq_len, 1]
+        handles.append(layer.self_attn.v_proj.register_forward_hook(
+            _make_proj_quant_hook(bits, num_kv_heads, head_dim, quant_dim=-1)
+        ))
 
     try:
         result = _evaluate_ppl_core(model, tokenizer, seq_len, max_samples, device)
         result["method"] = f"KIVI {bits}-bit"
     finally:
-        for h in hook_handles:
+        for h in handles:
             h.remove()
 
     return result
@@ -120,131 +121,122 @@ def evaluate_ppl_with_salience_quant(
     max_samples: int = 5,
     device: str | None = None,
 ) -> dict:
-    """Evaluate perplexity with SalienceQuant-style mixed-precision quantization.
+    """Evaluate perplexity with SalienceQuant-style mixed-precision KV cache quantization.
 
-    Uses attention-weight-based importance scoring to apply different quantization
-    levels to different tokens' attention outputs.
+    K: uniform 4-bit per-channel quantization.
+    V: tiered quantization — token importance is estimated from attention weights
+       accumulated across windows (EMA). Important tokens stay at higher precision.
     """
     if device is None:
         device = next(model.parameters()).device
-
+    num_kv_heads, head_dim = _get_kv_config(model)
     config = tier_config or TierConfig()
-    num_layers = model.config.num_hidden_layers
-    hook_handles = []
 
-    # Track attention scores across layers for importance-based quantization
-    attn_scores: dict[int, torch.Tensor] = {}
-    alpha = 0.3
+    # Per-layer accumulated importance scores [seq_len], updated after each window.
+    layer_importance: dict[int, torch.Tensor] = {}
+    handles = []
 
-    def make_salience_hook(layer_idx, config):
-        def hook_fn(module, args, kwargs, output):
-            if not isinstance(output, tuple):
-                return output
+    def make_v_hook(layer_idx: int):
+        def hook_fn(module, args, output):
+            batch, seq_len_cur, _ = output.shape
+            out = output.view(batch, seq_len_cur, num_kv_heads, head_dim).transpose(1, 2)
+            # out: [batch, num_kv_heads, seq_len_cur, head_dim]
 
-            attn_out = output[0]  # [batch, seq_len, hidden]
-            attn_weights = output[1] if len(output) > 1 else None
+            imp = layer_importance.get(layer_idx)
+            if imp is None:
+                # Prior: first 4 tokens are attention sinks, rest unknown
+                imp = torch.zeros(seq_len_cur, device=out.device)
+                imp[:4] = 1.0
+            else:
+                imp = imp.to(out.device)
+                if imp.size(0) < seq_len_cur:
+                    pad = torch.zeros(seq_len_cur - imp.size(0), device=imp.device)
+                    imp = torch.cat([pad, imp])
+                imp = imp[-seq_len_cur:]
 
-            if attn_weights is not None:
-                # Track importance via attention (mean over batch and q heads)
-                imp = attn_weights.detach().float().mean(dim=(0, 1, 2))  # [kv_len]
-
-                if layer_idx in attn_scores:
-                    prev = attn_scores[layer_idx]
-                    if imp.size(0) > prev.size(0):
-                        pad = torch.zeros(imp.size(0) - prev.size(0), device=prev.device)
-                        prev = torch.cat([prev, pad])
-                    attn_scores[layer_idx] = (1 - alpha) * prev[:imp.size(0)] + alpha * imp
-                else:
-                    attn_scores[layer_idx] = imp
-
-                # Apply tiered quantization based on importance
-                importance = attn_scores[layer_idx]
-                attn_out_q = _apply_tiered_quant_to_output(
-                    attn_out, importance, config
-                )
-                return (attn_out_q,) + output[1:]
-
-            # Fallback: uniform 4-bit
-            q, s = quantize_symmetric(attn_out, bits=4, dim=-1)
-            attn_out_q = dequantize_symmetric(q, s).to(attn_out.dtype)
-            return (attn_out_q,) + output[1:]
-
+            out_q = _apply_tiered_quant_to_v(out, imp, config)
+            return out_q.transpose(1, 2).contiguous().view(batch, seq_len_cur, num_kv_heads * head_dim)
         return hook_fn
 
-    for layer_idx in range(num_layers):
-        layer = model.model.layers[layer_idx]
-        h = layer.self_attn.register_forward_hook(
-            make_salience_hook(layer_idx, config), with_kwargs=True
-        )
-        hook_handles.append(h)
+    def make_attn_hook(layer_idx: int):
+        def hook_fn(module, args, kwargs, output):
+            # output[1]: [batch, q_heads, seq_len, seq_len] attention weights
+            if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
+                attn_w = output[1].detach().float()
+                # How much attention each key position receives, averaged over queries and heads
+                imp = attn_w.mean(dim=(0, 1, 2)).cpu()  # [kv_seq_len]
+                prev = layer_importance.get(layer_idx)
+                if prev is not None and prev.size(0) == imp.size(0):
+                    layer_importance[layer_idx] = 0.7 * prev + 0.3 * imp
+                else:
+                    layer_importance[layer_idx] = imp
+        return hook_fn
+
+    for layer_idx, layer in enumerate(model.model.layers):
+        # K: 4-bit per-channel
+        handles.append(layer.self_attn.k_proj.register_forward_hook(
+            _make_proj_quant_hook(4, num_kv_heads, head_dim, quant_dim=2)
+        ))
+        # V: tiered based on accumulated importance
+        handles.append(layer.self_attn.v_proj.register_forward_hook(
+            make_v_hook(layer_idx)
+        ))
+        # Capture attention weights to update importance for future windows
+        handles.append(layer.self_attn.register_forward_hook(
+            make_attn_hook(layer_idx), with_kwargs=True
+        ))
 
     try:
         result = _evaluate_ppl_core(
-            model, tokenizer, seq_len, max_samples, device,
-            output_attentions=True,
+            model, tokenizer, seq_len, max_samples, device, output_attentions=True
         )
         result["method"] = "SalienceQuant"
     finally:
-        for h in hook_handles:
+        for h in handles:
             h.remove()
-        attn_scores.clear()
+        layer_importance.clear()
 
     return result
 
 
-def _apply_tiered_quant_to_output(
-    attn_out: torch.Tensor,
+def _apply_tiered_quant_to_v(
+    v: torch.Tensor,
     importance: torch.Tensor,
     config: TierConfig,
 ) -> torch.Tensor:
-    """Apply tiered quantization to attention output based on importance scores.
+    """Apply tiered quantization to V tensor based on per-token importance.
 
     Args:
-        attn_out: [batch, seq_len, hidden_dim]
+        v: [batch, kv_heads, seq_len, head_dim]
         importance: [seq_len] importance scores
         config: Tier percentages
     """
-    dtype = attn_out.dtype
-    seq_len = attn_out.size(1)
-    result = attn_out.clone()
+    dtype = v.dtype
+    seq_len = v.size(2)
+    result = v.clone()
 
-    if importance.size(0) < seq_len:
-        # Pad importance to match sequence length
-        pad = torch.zeros(seq_len - importance.size(0), device=importance.device)
-        importance = torch.cat([importance, pad])
-    importance = importance[:seq_len]
+    sorted_idx = importance.argsort(descending=True)
+    n_fp16 = max(4, int(seq_len * config.fp16_pct))
+    n_int8 = int(seq_len * config.int8_pct)
+    n_int4 = int(seq_len * config.int4_pct)
 
-    # Sort tokens by importance
-    sorted_indices = importance.argsort(descending=True)
-    n = seq_len
+    def quant_tokens(idx, bits):
+        chunk = v[:, :, idx, :]  # [batch, kv_heads, n_tokens, head_dim]
+        q, s = quantize_symmetric(chunk, bits=bits, dim=-1)  # per-token
+        return dequantize_symmetric(q, s).to(dtype)
 
-    # Assign tiers
-    n_fp16 = max(4, int(n * config.fp16_pct))  # at least sink tokens
-    n_int8 = int(n * config.int8_pct)
-    n_int4 = int(n * config.int4_pct)
-
-    # FP16: keep as-is (top importance + sinks)
-    # INT8 tier
     if n_int8 > 0:
-        int8_idx = sorted_indices[n_fp16:n_fp16 + n_int8]
-        chunk = attn_out[:, int8_idx, :]
-        q, s = quantize_symmetric(chunk, bits=8, dim=-1)
-        result[:, int8_idx, :] = dequantize_symmetric(q, s).to(dtype)
+        idx = sorted_idx[n_fp16:n_fp16 + n_int8]
+        result[:, :, idx, :] = quant_tokens(idx, 8)
 
-    # INT4 tier
     if n_int4 > 0:
-        int4_idx = sorted_indices[n_fp16 + n_int8:n_fp16 + n_int8 + n_int4]
-        chunk = attn_out[:, int4_idx, :]
-        q, s = quantize_symmetric(chunk, bits=4, dim=-1)
-        result[:, int4_idx, :] = dequantize_symmetric(q, s).to(dtype)
+        idx = sorted_idx[n_fp16 + n_int8:n_fp16 + n_int8 + n_int4]
+        result[:, :, idx, :] = quant_tokens(idx, 4)
 
-    # INT2 tier (remaining)
     int2_start = n_fp16 + n_int8 + n_int4
-    if int2_start < n:
-        int2_idx = sorted_indices[int2_start:]
-        chunk = attn_out[:, int2_idx, :]
-        q, s = quantize_symmetric(chunk, bits=2, dim=-1)
-        result[:, int2_idx, :] = dequantize_symmetric(q, s).to(dtype)
+    if int2_start < seq_len:
+        idx = sorted_idx[int2_start:]
+        result[:, :, idx, :] = quant_tokens(idx, 2)
 
     return result
 
@@ -289,11 +281,7 @@ def _evaluate_ppl_core(
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = chunk[:, 1:].contiguous()
 
-        if begin == 0:
-            target_start = 0
-        else:
-            target_start = seq_len - stride
-
+        target_start = 0 if begin == 0 else seq_len - stride
         shift_logits = shift_logits[:, target_start:, :]
         shift_labels = shift_labels[:, target_start:]
 
@@ -327,53 +315,42 @@ def run_ppl_comparison(
     max_samples: int = 5,
     device: str | None = None,
 ) -> list[dict]:
-    """Run perplexity comparison across all methods.
-
-    Returns:
-        List of dicts, each with "method", "perplexity", "loss", etc.
-    """
+    """Run perplexity comparison across all methods."""
     if device is None:
         device = next(model.parameters()).device
 
     results = []
 
-    # 1. FP16 baseline
     print("Evaluating FP16 baseline...")
     r = _evaluate_ppl_core(model, tokenizer, seq_len, max_samples, device)
     r["method"] = "FP16 (baseline)"
     results.append(r)
 
-    # 2. Uniform INT8
     print("Evaluating Uniform INT8...")
     results.append(evaluate_ppl_with_uniform_quant(
         model, tokenizer, bits=8, seq_len=seq_len, max_samples=max_samples, device=device
     ))
 
-    # 3. Uniform INT4
     print("Evaluating Uniform INT4...")
     results.append(evaluate_ppl_with_uniform_quant(
         model, tokenizer, bits=4, seq_len=seq_len, max_samples=max_samples, device=device
     ))
 
-    # 4. KIVI 4-bit
     print("Evaluating KIVI 4-bit...")
     results.append(evaluate_ppl_with_kivi_quant(
         model, tokenizer, bits=4, seq_len=seq_len, max_samples=max_samples, device=device
     ))
 
-    # 5. KIVI 2-bit
     print("Evaluating KIVI 2-bit...")
     results.append(evaluate_ppl_with_kivi_quant(
         model, tokenizer, bits=2, seq_len=seq_len, max_samples=max_samples, device=device
     ))
 
-    # 6. SalienceQuant default
     print("Evaluating SalienceQuant...")
     results.append(evaluate_ppl_with_salience_quant(
         model, tokenizer, seq_len=seq_len, max_samples=max_samples, device=device
     ))
 
-    # 7. SalienceQuant aggressive (more INT2)
     print("Evaluating SalienceQuant (aggressive)...")
     aggressive_config = TierConfig(fp16_pct=0.03, int8_pct=0.07, int4_pct=0.20)
     r = evaluate_ppl_with_salience_quant(
