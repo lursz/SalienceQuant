@@ -1,5 +1,8 @@
 # SalienceQuant — KV Cache Quantization Experiments
 
+default:
+    @just --list
+
 set dotenv-load := false
 
 default_model := "0.5b"
