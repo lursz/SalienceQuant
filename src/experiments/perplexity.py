@@ -258,6 +258,8 @@ def _evaluate_ppl_core(
     output_attentions: bool = False,
 ) -> dict:
     """Core perplexity evaluation loop."""
+    if device == "auto":
+        device = next(model.parameters()).device
     input_ids = load_wikitext2(tokenizer).to(device)
     total_len = input_ids.size(1)
     stride = seq_len // 2

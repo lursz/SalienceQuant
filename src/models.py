@@ -43,6 +43,7 @@ def load_model(
         torch_dtype=dtype,
         device_map=device if device == "auto" else None,
         trust_remote_code=True,
+        attn_implementation="eager",
     )
     if device != "auto":
         model = model.to(device)
