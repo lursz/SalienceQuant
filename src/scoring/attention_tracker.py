@@ -37,7 +37,6 @@ class AttentionTracker:
 
         # Per-layer, per-KV-head cumulative scores: [num_kv_heads, seq_len]
         self.scores: dict[int, torch.Tensor] = {}
-        self.step_count: int = 0
 
     def update(
         self,
@@ -83,6 +82,9 @@ class AttentionTracker:
                     device=prev.device, dtype=prev.dtype,
                 )
                 prev = torch.cat([prev, pad], dim=1)
+            elif kv_len < prev_len:
+                # Sequence shrunk (cache reset or reuse) — truncate
+                prev = prev[:, :kv_len]
 
             # EMA update
             self.scores[layer_idx] = (1 - self.alpha) * prev + self.alpha * attn
@@ -126,7 +128,3 @@ class AttentionTracker:
     def reset(self):
         """Clear all tracked scores."""
         self.scores.clear()
-        self.step_count = 0
-
-    def increment_step(self):
-        self.step_count += 1

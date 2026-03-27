@@ -59,45 +59,40 @@ def compute_fisher_per_channel(
     value_fisher = {i: torch.zeros(num_kv_heads, head_dim, device=device)
                     for i in range(num_layers)}
 
-    # Register hooks to capture KV states with gradients
-    kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-    hooks = []
-
-    def make_capture_hook(layer_idx):
-        def hook_fn(module, args, kwargs, output):
-            # We need access to the key/value states before they enter the cache
-            # In HF transformers, these are computed inside the attention module
-            # We'll use a different approach: perturb attention output
-            pass
-        return hook_fn
-
     model.eval()
 
     for sample_idx in tqdm(range(num_samples), desc="Computing Fisher"):
         start = (sample_idx * seq_len) % (len(all_ids) - seq_len)
         input_ids = all_ids[start:start + seq_len].unsqueeze(0).to(device)
 
-        # Forward pass with gradient tracking on attention outputs
-        # We hook into each attention layer to capture and track gradients
-        layer_outputs = {}
+        # Hook into k_proj and v_proj to capture their outputs with gradient tracking
+        k_proj_outputs: dict[int, torch.Tensor] = {}
+        v_proj_outputs: dict[int, torch.Tensor] = {}
         hook_handles = []
 
         for layer_idx in range(num_layers):
             layer = model.model.layers[layer_idx]
 
-            def make_hook(idx):
-                def hook_fn(module, args, kwargs, output):
-                    if isinstance(output, tuple):
-                        # Make attention output require gradient for Fisher computation
-                        attn_out = output[0]
-                        attn_out_tracked = attn_out.detach().requires_grad_(True)
-                        layer_outputs[idx] = attn_out_tracked
-                        return (attn_out_tracked,) + output[1:]
-                    return output
+            def make_k_hook(idx):
+                def hook_fn(module, args, output):
+                    tracked = output.detach().requires_grad_(True)
+                    k_proj_outputs[idx] = tracked
+                    return tracked
                 return hook_fn
 
-            h = layer.self_attn.register_forward_hook(make_hook(layer_idx), with_kwargs=True)
-            hook_handles.append(h)
+            def make_v_hook(idx):
+                def hook_fn(module, args, output):
+                    tracked = output.detach().requires_grad_(True)
+                    v_proj_outputs[idx] = tracked
+                    return tracked
+                return hook_fn
+
+            hook_handles.append(
+                layer.self_attn.k_proj.register_forward_hook(make_k_hook(layer_idx))
+            )
+            hook_handles.append(
+                layer.self_attn.v_proj.register_forward_hook(make_v_hook(layer_idx))
+            )
 
         try:
             # Forward pass
@@ -112,30 +107,29 @@ def compute_fisher_per_channel(
                 shift_labels.view(-1),
             )
 
-            # Backward through each layer's attention output
-            for layer_idx, attn_out in layer_outputs.items():
-                if attn_out.grad_fn is not None:
-                    grad = torch.autograd.grad(
-                        loss, attn_out, retain_graph=True, allow_unused=True
-                    )[0]
-                    if grad is not None:
-                        # grad: [batch, seq_len, hidden_size]
-                        # Reshape to [batch, seq_len, num_kv_heads, head_dim_per_group]
-                        # For GQA, multiple Q heads share one KV head
-                        num_q_heads = model.config.num_attention_heads
-                        num_groups = num_q_heads // num_kv_heads
+            # Compute gradients separately for K and V projections
+            all_tracked = list(k_proj_outputs.values()) + list(v_proj_outputs.values())
+            grads = torch.autograd.grad(
+                loss, all_tracked, retain_graph=False, allow_unused=True
+            )
+            k_grads = grads[:len(k_proj_outputs)]
+            v_grads = grads[len(k_proj_outputs):]
 
-                        grad_sq = grad.float().pow(2).mean(dim=(0, 1))
-                        # grad_sq: [hidden_size]
-                        # Reshape to [num_q_heads, head_dim] then aggregate per KV head
-                        grad_sq = grad_sq.view(num_q_heads, head_dim)
-                        if num_groups > 1:
-                            grad_sq = grad_sq.view(num_kv_heads, num_groups, head_dim).mean(dim=1)
-                        # grad_sq: [num_kv_heads, head_dim]
+            for layer_idx in range(num_layers):
+                # Key Fisher: dL/dK_proj output
+                k_grad = k_grads[layer_idx]
+                if k_grad is not None:
+                    # k_grad: [batch, seq_len, num_kv_heads * head_dim]
+                    grad_sq = k_grad.float().pow(2).mean(dim=(0, 1))
+                    grad_sq = grad_sq.view(num_kv_heads, head_dim)
+                    key_fisher[layer_idx] += grad_sq
 
-                        # Accumulate (same Fisher for K and V at this approximation level)
-                        key_fisher[layer_idx] += grad_sq
-                        value_fisher[layer_idx] += grad_sq
+                # Value Fisher: dL/dV_proj output
+                v_grad = v_grads[layer_idx]
+                if v_grad is not None:
+                    grad_sq = v_grad.float().pow(2).mean(dim=(0, 1))
+                    grad_sq = grad_sq.view(num_kv_heads, head_dim)
+                    value_fisher[layer_idx] += grad_sq
 
         finally:
             for h in hook_handles:

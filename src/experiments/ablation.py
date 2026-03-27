@@ -1,15 +1,14 @@
 """Ablation study: isolate the contribution of each SalienceQuant component.
 
-Components ablated:
+Components ablated (in order):
     1. Base: Uniform INT4 (no importance awareness)
     2. +Attention scoring: use attention scores for tier assignment
-    3. +V-deviation: use Key Fisher metric (attention × V-deviation) for Keys
-    4. +Multi-tier: 4 tiers instead of 2 (FP16/INT4 → FP16/INT8/INT4/INT2)
-    5. +Attention sinks: protect first K tokens in FP16
-    6. +EMA decay: exponential decay on attention scores
+    3. +Multi-tier: 4 tiers instead of 2 (FP16/INT4 → FP16/INT8/INT4/INT2)
+    4. +Attention sinks: protect first K tokens in FP16
+    5. +EMA decay: exponential decay on attention scores
+    6. +V-deviation: use Key importance metric (attention × V-deviation) for Keys
     7. +Per-layer budget: different tier configs per layer based on sensitivity
     8. +Fisher channel weights: offline Fisher prior for channel importance
-    9. Full SalienceQuant: all components
 """
 
 import torch

@@ -68,20 +68,17 @@ def get_model_config(model: AutoModelForCausalLM) -> dict:
 
 
 class AttentionHook:
-    """Hook to capture attention weights and KV cache from model layers.
+    """Hook to capture attention weights from model layers.
 
-    Registers forward hooks on attention layers to capture:
-    - Attention weights (after softmax)
-    - Key and Value states
-    - Query states
+    Registers forward hooks on attention layers to capture attention weights
+    (after softmax) when output_attentions=True.
+
+    For full K/V/Q capture, use src.experiments.capture.capture_states instead.
     """
 
     def __init__(self, model: AutoModelForCausalLM):
         self.model = model
         self.attention_weights: dict[int, torch.Tensor] = {}
-        self.key_states: dict[int, torch.Tensor] = {}
-        self.value_states: dict[int, torch.Tensor] = {}
-        self.query_states: dict[int, torch.Tensor] = {}
         self._hooks: list = []
 
     def register(self, layer_indices: list[int] | None = None):
@@ -122,9 +119,6 @@ class AttentionHook:
             hook.remove()
         self._hooks.clear()
         self.attention_weights.clear()
-        self.key_states.clear()
-        self.value_states.clear()
-        self.query_states.clear()
 
     def __del__(self):
         self.clear()

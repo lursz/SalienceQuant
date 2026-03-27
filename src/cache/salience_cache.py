@@ -80,13 +80,12 @@ class SalienceCache:
 
         self._step: int = 0
         self._is_quantized: dict[int, bool] = {}
+        self._seq_len: int = 0
 
     @property
     def seq_len(self) -> int:
-        """Current sequence length (from first layer)."""
-        for layer_idx in self._full_keys:
-            return self._full_keys[layer_idx].size(2)
-        return 0
+        """Current sequence length."""
+        return self._seq_len
 
     def update(
         self,
@@ -130,6 +129,9 @@ class SalienceCache:
             self._full_keys[layer_idx] = key_states
             self._full_values[layer_idx] = value_states
 
+        # Track actual sequence length
+        self._seq_len = self._full_keys[layer_idx].size(2)
+
         # Update attention-based scores (every step, cheap)
         self.scorer.update_attention(
             layer_idx, attention_weights, self.num_kv_groups
@@ -147,7 +149,6 @@ class SalienceCache:
         # After all layers updated, check if we should re-quantize
         if layer_idx == self.num_layers - 1:
             self._step += 1
-            self.scorer.attention_tracker.increment_step()
             if should_rescore:
                 self._requantize_all()
 
@@ -194,33 +195,31 @@ class SalienceCache:
         key_imp = key_imp[:seq_len]
         val_imp = val_imp[:seq_len]
 
-        # If Fisher weights available, scale importance by channel sensitivity
-        # We use the mean Fisher weight across channels as a layer-level scaling factor
+        # Get Fisher channel weights if available (passed to quantizer for per-channel scaling)
+        key_fisher_weights = None
+        val_fisher_weights = None
         if self.fisher_weights is not None:
-            key_channel_weights = self.fisher_weights.get_channel_weights(layer_idx, "key")
-            val_channel_weights = self.fisher_weights.get_channel_weights(layer_idx, "value")
-            # Mean Fisher across channels as a scalar layer-level weight
-            key_fisher_scale = key_channel_weights.mean().item()
-            val_fisher_scale = val_channel_weights.mean().item()
-            key_imp = key_imp * key_fisher_scale
-            val_imp = val_imp * val_fisher_scale
-
-        # Combined importance (max of key and value importance)
-        combined_imp = torch.max(key_imp, val_imp)
+            key_fisher_weights = self.fisher_weights.get_channel_weights(layer_idx, "key")
+            val_fisher_weights = self.fisher_weights.get_channel_weights(layer_idx, "value")
 
         # Protected mask
         protected = get_protected_mask(
             seq_len, self.num_sink_tokens, self.recent_window, device
         )
 
-        # Assign tiers using per-layer config
+        # Assign tiers separately for Keys and Values (asymmetric scoring)
         tier_config = self._get_tier_config(layer_idx)
-        tiers = assign_tiers(combined_imp, protected, tier_config)
-        self._tier_assignments[layer_idx] = tiers
+        key_tiers = assign_tiers(key_imp, protected, tier_config)
+        val_tiers = assign_tiers(val_imp, protected, tier_config)
+        self._tier_assignments[layer_idx] = key_tiers  # store key tiers for diagnostics
 
-        # Quantize
+        # Quantize with separate K/V tier maps and per-channel Fisher weights
         quantizer = TieredQuantizer()
-        quantizer.quantize_and_store(keys, values, tiers)
+        quantizer.quantize_and_store(
+            keys, values, key_tiers, val_tiers,
+            key_fisher_weights=key_fisher_weights,
+            value_fisher_weights=val_fisher_weights,
+        )
         self._quantizers[layer_idx] = quantizer
         self._is_quantized[layer_idx] = True
 
@@ -292,3 +291,4 @@ class SalienceCache:
         self._is_quantized.clear()
         self.scorer.reset()
         self._step = 0
+        self._seq_len = 0

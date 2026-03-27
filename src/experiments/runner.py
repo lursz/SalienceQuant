@@ -99,11 +99,14 @@ def run_ablation_experiment(args):
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # Optionally generate per-layer budget
+    # Note: without real sensitivity profiling, we skip per-layer budget
+    # since uniform sensitivity produces identical configs across layers.
     per_layer_configs = None
-    if not args.no_budget:
+    if not args.no_budget and hasattr(args, 'sensitivity_path') and args.sensitivity_path:
         from src.budget import optimize_tier_configs
-        # Use uniform sensitivity as default (real sensitivity requires model)
-        sensitivity = {i: 0.5 for i in range(states.num_layers)}
+        import json
+        with open(args.sensitivity_path) as f:
+            sensitivity = {int(k): v for k, v in json.load(f).items()}
         per_layer_configs = optimize_tier_configs(
             states.num_layers, sensitivity, target_avg_bits=4.0
         )
@@ -251,6 +254,8 @@ def main():
 
     # Ablation options
     parser.add_argument("--no-budget", action="store_true", help="Skip per-layer budget in ablation")
+    parser.add_argument("--sensitivity-path", type=str, default=None,
+                        help="Path to JSON sensitivity profile for per-layer budget")
 
     args = parser.parse_args()
 

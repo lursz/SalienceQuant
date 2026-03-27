@@ -61,15 +61,21 @@ def profile_layer_sensitivity(
 
     # Step 2: Per-layer quantization
     layer_ppl = {}
-    hooks = []
+
+    num_kv_heads = getattr(model.config, "num_key_value_heads", model.config.num_attention_heads)
+    head_dim = model.config.hidden_size // model.config.num_attention_heads
 
     for layer_idx in tqdm(range(num_layers), desc="Profiling layers"):
-        # Register a hook that quantizes KV for this layer only
+        # Register hooks that quantize K and V projections for this layer only
         layer = model.model.layers[layer_idx]
-        hook_handle = layer.self_attn.register_forward_hook(
-            _make_kv_quant_hook(bits), with_kwargs=True,
+        # K: per-channel quantization (dim=2)
+        h_k = layer.self_attn.k_proj.register_forward_hook(
+            _make_proj_quant_hook(bits, num_kv_heads, head_dim, quant_dim=2)
         )
-        hooks.append(hook_handle)
+        # V: per-token quantization (dim=-1)
+        h_v = layer.self_attn.v_proj.register_forward_hook(
+            _make_proj_quant_hook(bits, num_kv_heads, head_dim, quant_dim=-1)
+        )
 
         try:
             result = evaluate_perplexity(
@@ -77,8 +83,8 @@ def profile_layer_sensitivity(
             )
             layer_ppl[layer_idx] = result["perplexity"]
         finally:
-            hook_handle.remove()
-            hooks.pop()
+            h_k.remove()
+            h_v.remove()
 
     # Step 3: Compute sensitivity
     layer_sensitivity = {
@@ -100,27 +106,21 @@ def profile_layer_sensitivity(
     }
 
 
-def _make_kv_quant_hook(bits: int):
-    """Create a forward hook that quantizes the KV output of an attention layer."""
+def _make_proj_quant_hook(bits: int, num_kv_heads: int, head_dim: int, quant_dim: int):
+    """Create a forward hook that quantizes a K or V projection output.
 
-    def hook_fn(module, args, kwargs, output):
-        # output is typically (attn_output, attn_weights, past_key_value)
-        # We need to intercept past_key_value and quantize it
-        # However, the actual KV states flow through the cache mechanism,
-        # so we hook into the layer's output and quantize the hidden states
-        # that will become the next layer's input.
-        #
-        # Simpler approach: quantize the attention output directly.
-        # This simulates the effect of KV cache quantization on the layer's
-        # contribution to the model output.
-        if isinstance(output, tuple):
-            attn_output = output[0]
-            # Quantize and dequantize the attention output
-            q, s = quantize_symmetric(attn_output, bits=bits, dim=-1)
-            attn_output_q = dequantize_symmetric(q, s).to(attn_output.dtype)
-            return (attn_output_q,) + output[1:]
-        return output
+    Reshapes [batch, seq, kv_heads*head_dim] -> [batch, kv_heads, seq, head_dim],
+    quantizes along quant_dim, then reshapes back.
 
+    quant_dim=2  -> per-channel K (scale per head_dim channel, shared over seq)
+    quant_dim=-1 -> per-token V  (scale per token, shared over head_dim)
+    """
+    def hook_fn(module, args, output):
+        batch, seq_len, _ = output.shape
+        out = output.view(batch, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+        q, s = quantize_symmetric(out, bits=bits, dim=quant_dim)
+        dequant = dequantize_symmetric(q, s).to(output.dtype)
+        return dequant.transpose(1, 2).contiguous().view(batch, seq_len, num_kv_heads * head_dim)
     return hook_fn
 
 

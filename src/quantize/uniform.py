@@ -164,12 +164,30 @@ class UniformQuantizedKVCache:
         return len(self._cache)
 
     def memory_bytes(self) -> int:
-        """Estimate total memory used by quantized cache."""
+        """Estimate total logical memory used by quantized cache.
+
+        Quantized tensors are stored as int8 in PyTorch (no native sub-byte dtype),
+        but we report the *logical* packed size (e.g. INT4 = 0.5 bytes/element).
+        Scale tensors are counted at their actual dtype size.
+        """
         total = 0
         for entry in self._cache:
             if entry is None:
                 continue
-            for t in entry:
-                if isinstance(t, torch.Tensor):
-                    total += t.nelement() * t.element_size()
+            if self.symmetric:
+                q_k, s_k, q_v, s_v = entry
+                # Quantized tensors: logical packed size
+                total += q_k.nelement() * self.bits // 8
+                total += q_v.nelement() * self.bits // 8
+                # Scale tensors: actual size
+                total += s_k.nelement() * s_k.element_size()
+                total += s_v.nelement() * s_v.element_size()
+            else:
+                q_k, s_k, z_k, q_v, s_v, z_v = entry
+                total += q_k.nelement() * self.bits // 8
+                total += q_v.nelement() * self.bits // 8
+                total += s_k.nelement() * s_k.element_size()
+                total += z_k.nelement() * z_k.element_size()
+                total += s_v.nelement() * s_v.element_size()
+                total += z_v.nelement() * z_v.element_size()
         return total

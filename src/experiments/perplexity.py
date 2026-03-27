@@ -88,6 +88,7 @@ def evaluate_ppl_with_uniform_quant(
     """Evaluate perplexity with uniform KV cache quantization.
 
     Quantizes both K and V with per-token symmetric quantization (dim=-1).
+    This is a true uniform baseline: same quantization granularity for both.
     """
     if device is None:
         device = next(model.parameters()).device
@@ -95,9 +96,9 @@ def evaluate_ppl_with_uniform_quant(
     handles = []
 
     for layer in model.model.layers:
-        # K: per-channel (dim=2) — K has channel-wise outliers, per-token scale is dominated by them
+        # K: per-token (dim=-1) — true uniform baseline
         handles.append(layer.self_attn.k_proj.register_forward_hook(
-            _make_proj_quant_hook(bits, num_kv_heads, head_dim, quant_dim=2)
+            _make_proj_quant_hook(bits, num_kv_heads, head_dim, quant_dim=-1)
         ))
         # V: per-token (dim=-1)
         handles.append(layer.self_attn.v_proj.register_forward_hook(
@@ -165,68 +166,129 @@ def evaluate_ppl_with_salience_quant(
     seq_len: int = 2048,
     max_samples: int = 5,
     device: str | None = None,
+    alpha: float = 0.2,
 ) -> dict:
     """Evaluate perplexity with SalienceQuant-style mixed-precision KV cache quantization.
 
-    K: uniform 4-bit per-channel quantization.
-    V: tiered quantization — token importance is estimated from attention weights
-       accumulated across windows (EMA). Important tokens stay at higher precision.
+    K: tiered quantization based on V-deviation importance (per-channel within tier).
+    V: tiered quantization based on attention importance (per-token within tier).
+    Both use EMA-decayed importance from previous windows.
     """
     if device is None:
         device = next(model.parameters()).device
     num_kv_heads, head_dim = _get_kv_config(model)
+    num_q_heads = model.config.num_attention_heads
+    num_kv_groups = num_q_heads // num_kv_heads
     config = tier_config or TierConfig()
 
     # Per-layer accumulated importance scores [seq_len], updated after each window.
-    layer_importance: dict[int, torch.Tensor] = {}
+    key_importance: dict[int, torch.Tensor] = {}
+    val_importance: dict[int, torch.Tensor] = {}
+    # Captured V from v_proj hooks (for V-deviation computation in attn hook)
+    captured_v: dict[int, torch.Tensor] = {}
+    # Captured Q from q_proj hooks (for V-deviation computation in attn hook)
+    captured_q: dict[int, torch.Tensor] = {}
     handles = []
+
+    def _get_importance(store, layer_idx, seq_len_cur, dev):
+        """Get importance vector, with cold-start prior if not yet available."""
+        imp = store.get(layer_idx)
+        if imp is None:
+            imp = torch.zeros(seq_len_cur, device=dev)
+            imp[:4] = 1.0
+            n_recent = min(64, seq_len_cur - 4)
+            imp[-n_recent:] = torch.linspace(0.3, 1.0, n_recent, device=dev)
+        else:
+            imp = imp.to(dev)
+            if imp.size(0) < seq_len_cur:
+                pad = torch.full((seq_len_cur - imp.size(0),), imp.mean().item(), device=imp.device)
+                imp = torch.cat([pad, imp])
+            imp = imp[-seq_len_cur:]
+        return imp
+
+    def make_k_hook(layer_idx: int):
+        def hook_fn(_module, _args, output):
+            batch, seq_len_cur, _ = output.shape
+            out = output.view(batch, seq_len_cur, num_kv_heads, head_dim).transpose(1, 2)
+            imp = _get_importance(key_importance, layer_idx, seq_len_cur, out.device)
+            out_q = _apply_tiered_quant_to_k(out, imp, config)
+            return out_q.transpose(1, 2).contiguous().view(batch, seq_len_cur, num_kv_heads * head_dim)
+        return hook_fn
 
     def make_v_hook(layer_idx: int):
         def hook_fn(_module, _args, output):
             batch, seq_len_cur, _ = output.shape
             out = output.view(batch, seq_len_cur, num_kv_heads, head_dim).transpose(1, 2)
-            # out: [batch, num_kv_heads, seq_len_cur, head_dim]
-
-            imp = layer_importance.get(layer_idx)
-            if imp is None:
-                # Cold-start prior: attention sinks (first 4) + recency (last 64)
-                # are most important. Middle tokens start low.
-                imp = torch.zeros(seq_len_cur, device=out.device)
-                imp[:4] = 1.0
-                n_recent = min(64, seq_len_cur - 4)
-                imp[-n_recent:] = torch.linspace(0.3, 1.0, n_recent, device=out.device)
-            else:
-                imp = imp.to(out.device)
-                if imp.size(0) < seq_len_cur:
-                    # Prepend high-importance prior for unseen older tokens
-                    pad = torch.full((seq_len_cur - imp.size(0),), imp.mean().item(), device=imp.device)
-                    imp = torch.cat([pad, imp])
-                imp = imp[-seq_len_cur:]
-
+            # Save V for V-deviation computation in the attention hook
+            captured_v[layer_idx] = out.detach()
+            imp = _get_importance(val_importance, layer_idx, seq_len_cur, out.device)
             out_q = _apply_tiered_quant_to_v(out, imp, config)
             return out_q.transpose(1, 2).contiguous().view(batch, seq_len_cur, num_kv_heads * head_dim)
         return hook_fn
 
+    def make_q_hook(layer_idx: int):
+        def hook_fn(_module, _args, output):
+            # output: [batch, seq_len, num_q_heads * head_dim]
+            batch, seq_len_cur, _ = output.shape
+            captured_q[layer_idx] = output.view(
+                batch, seq_len_cur, num_q_heads, head_dim
+            ).transpose(1, 2).detach()
+        return hook_fn
+
     def make_attn_hook(layer_idx: int):
         def hook_fn(_module, _args, _kwargs, output):
-            # output[1]: [batch, q_heads, seq_len, seq_len] attention weights
-            if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
-                attn_w = output[1].detach().float()
-                # How much attention each key position receives, averaged over queries and heads
-                imp = attn_w.mean(dim=(0, 1, 2)).cpu()  # [kv_seq_len]
-                prev = layer_importance.get(layer_idx)
-                if prev is not None and prev.size(0) == imp.size(0):
-                    layer_importance[layer_idx] = 0.7 * prev + 0.3 * imp
+            if not (isinstance(output, tuple) and len(output) > 1 and output[1] is not None):
+                return
+            attn_w = output[1].detach().float()  # [batch, q_heads, seq, seq]
+
+            # Value importance: sum over queries, mean over batch/heads
+            v_imp = attn_w.sum(dim=2).mean(dim=(0, 1)).cpu()  # [kv_seq_len]
+            prev_v = val_importance.get(layer_idx)
+            if prev_v is not None and prev_v.size(0) == v_imp.size(0):
+                val_importance[layer_idx] = (1 - alpha) * prev_v + alpha * v_imp
+            else:
+                val_importance[layer_idx] = v_imp
+
+            # Key importance: V-deviation
+            v = captured_v.get(layer_idx)
+            q = captured_q.get(layer_idx)
+            if v is not None and q is not None:
+                # Compute attention output: attn_w @ V_expanded
+                v_exp = v.unsqueeze(2).expand(-1, -1, num_kv_groups, -1, -1)
+                v_exp = v_exp.reshape(v.size(0), num_q_heads, v.size(2), head_dim)
+                attn_output = torch.matmul(attn_w.to(v.device), v_exp.float())
+                # V-deviation: attention(t) * ||V(t) - output|| * ||Q|| / sqrt(d)
+                # Use last query position (most relevant for autoregressive)
+                output_last = attn_output[:, :, -1:, :]  # [batch, q_heads, 1, head_dim]
+                v_deviation = (v_exp - output_last).norm(dim=-1)  # [batch, q_heads, seq]
+                attn_last = attn_w[:, :, -1, :]  # [batch, q_heads, seq]
+                q_norm = q[:, :, -1, :].norm(dim=-1, keepdim=True)  # [batch, q_heads, 1]
+                k_imp = (attn_last * v_deviation.mean(dim=0).unsqueeze(0) * q_norm / (head_dim ** 0.5))
+                k_imp = k_imp.mean(dim=(0, 1)).cpu()  # [seq]
+                prev_k = key_importance.get(layer_idx)
+                if prev_k is not None and prev_k.size(0) == k_imp.size(0):
+                    key_importance[layer_idx] = (1 - alpha) * prev_k + alpha * k_imp
                 else:
-                    layer_importance[layer_idx] = imp
+                    key_importance[layer_idx] = k_imp
+            else:
+                # Fallback: use attention-based importance for keys too
+                prev_k = key_importance.get(layer_idx)
+                if prev_k is not None and prev_k.size(0) == v_imp.size(0):
+                    key_importance[layer_idx] = (1 - alpha) * prev_k + alpha * v_imp
+                else:
+                    key_importance[layer_idx] = v_imp
         return hook_fn
 
     for layer_idx, layer in enumerate(model.model.layers):
-        # K: 4-bit per-channel
+        # K: tiered based on V-deviation importance (per-channel within tier)
         handles.append(layer.self_attn.k_proj.register_forward_hook(
-            _make_proj_quant_hook(4, num_kv_heads, head_dim, quant_dim=2)
+            make_k_hook(layer_idx)
         ))
-        # V: tiered based on accumulated importance
+        # Capture Q for V-deviation computation
+        handles.append(layer.self_attn.q_proj.register_forward_hook(
+            make_q_hook(layer_idx)
+        ))
+        # V: tiered based on attention importance (per-token within tier)
         handles.append(layer.self_attn.v_proj.register_forward_hook(
             make_v_hook(layer_idx)
         ))
@@ -240,12 +302,60 @@ def evaluate_ppl_with_salience_quant(
             model, tokenizer, seq_len, max_samples, device, output_attentions=True
         )
         result["method"] = "SalienceQuant"
-        v_avg_bits = config.fp16_pct * 16 + config.int8_pct * 8 + config.int4_pct * 4 + config.int2_pct * 2
-        result["kv_mb"] = _kv_cache_mb(model, seq_len, k_avg_bits=4.0, v_avg_bits=v_avg_bits)
+        avg_bits = config.fp16_pct * 16 + config.int8_pct * 8 + config.int4_pct * 4 + config.int2_pct * 2
+        result["kv_mb"] = _kv_cache_mb(model, seq_len, k_avg_bits=avg_bits, v_avg_bits=avg_bits)
     finally:
         for h in handles:
             h.remove()
-        layer_importance.clear()
+        key_importance.clear()
+        val_importance.clear()
+        captured_v.clear()
+        captured_q.clear()
+
+    return result
+
+
+def _apply_tiered_quant_to_k(
+    k: torch.Tensor,
+    importance: torch.Tensor,
+    config: TierConfig,
+) -> torch.Tensor:
+    """Apply tiered quantization to K tensor based on per-token importance.
+
+    Uses per-channel quantization (dim=2) within each tier, matching KIVI's
+    Key quantization strategy.
+
+    Args:
+        k: [batch, kv_heads, seq_len, head_dim]
+        importance: [seq_len] importance scores
+        config: Tier percentages
+    """
+    dtype = k.dtype
+    seq_len = k.size(2)
+    result = k.clone()
+
+    sorted_idx = importance.argsort(descending=True)
+    n_fp16 = max(4, int(seq_len * config.fp16_pct))
+    n_int8 = int(seq_len * config.int8_pct)
+    n_int4 = int(seq_len * config.int4_pct)
+
+    def quant_tokens(idx, bits):
+        chunk = k[:, :, idx, :]  # [batch, kv_heads, n_tokens, head_dim]
+        q, s = quantize_symmetric(chunk, bits=bits, dim=2)  # per-channel
+        return dequantize_symmetric(q, s).to(dtype)
+
+    if n_int8 > 0:
+        idx = sorted_idx[n_fp16:n_fp16 + n_int8]
+        result[:, :, idx, :] = quant_tokens(idx, 8)
+
+    if n_int4 > 0:
+        idx = sorted_idx[n_fp16 + n_int8:n_fp16 + n_int8 + n_int4]
+        result[:, :, idx, :] = quant_tokens(idx, 4)
+
+    int2_start = n_fp16 + n_int8 + n_int4
+    if int2_start < seq_len:
+        idx = sorted_idx[int2_start:]
+        result[:, :, idx, :] = quant_tokens(idx, 2)
 
     return result
 
@@ -299,11 +409,15 @@ def _evaluate_ppl_core(
     max_samples: int,
     device: str,
     output_attentions: bool = False,
+    input_ids: torch.Tensor | None = None,
 ) -> dict:
     """Core perplexity evaluation loop."""
     if device == "auto":
         device = next(model.parameters()).device
-    input_ids = load_wikitext2(tokenizer).to(device)
+    if input_ids is None:
+        input_ids = load_wikitext2(tokenizer).to(device)
+    elif input_ids.device != torch.device(device):
+        input_ids = input_ids.to(device)
     total_len = input_ids.size(1)
     stride = seq_len // 2
 
@@ -370,10 +484,13 @@ def run_ppl_comparison(
     if device is None:
         device = next(model.parameters()).device
 
+    # Load WikiText-2 once for all evaluations
+    input_ids = load_wikitext2(tokenizer).to(device)
+
     results = []
 
     print("Evaluating FP16 baseline...")
-    r = _evaluate_ppl_core(model, tokenizer, seq_len, max_samples, device)
+    r = _evaluate_ppl_core(model, tokenizer, seq_len, max_samples, device, input_ids=input_ids)
     r["method"] = "FP16 (baseline)"
     r["kv_mb"] = _kv_cache_mb(model, seq_len, k_avg_bits=16, v_avg_bits=16)
     results.append(r)
@@ -396,7 +513,7 @@ def run_ppl_comparison(
     print("Evaluating KIVI 2-bit...")
     results.append(evaluate_ppl_with_kivi_quant(
         model, tokenizer, bits=2, seq_len=seq_len, max_samples=max_samples, device=device,
-        residual_length=seq_len // 2,  # protect half the sequence for 2-bit
+        residual_length=128,  # consistent with KIVI 4-bit
     ))
 
     # SalienceQuant tiers: FP16/INT8/INT4 only — INT2 is too coarse at short seq lengths.

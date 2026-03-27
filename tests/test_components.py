@@ -372,9 +372,19 @@ class TestBudget:
         config_2 = bits_to_tier_config(2.0)
         assert config_2.int2_pct > 0.9
 
-        # At 8 bits: significant FP16/INT8
+        # At 8 bits: 100% INT8 (exact analytical solution)
         config_8 = bits_to_tier_config(8.0)
-        assert config_8.fp16_pct > config_2.fp16_pct
+        assert config_8.int8_pct == 1.0
+
+        # At 12 bits: blend of FP16 and INT8
+        config_12 = bits_to_tier_config(12.0)
+        assert config_12.fp16_pct > config_2.fp16_pct
+
+        # Verify analytical correctness: actual bits match target
+        for target in [2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0]:
+            c = bits_to_tier_config(target)
+            actual = c.fp16_pct * 16 + c.int8_pct * 8 + c.int4_pct * 4 + c.int2_pct * 2
+            assert abs(actual - target) < 0.01, f"target={target}, actual={actual}"
 
     def test_optimize_tier_configs(self):
         from src.budget import optimize_tier_configs

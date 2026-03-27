@@ -87,8 +87,9 @@ class ImportanceScorer:
         # value_states: [batch, num_kv_heads, kv_len, head_dim]
         # attention_output: [batch, num_q_heads, query_len, head_dim]
 
-        # Average output across batch and query_len -> [num_q_heads, head_dim]
-        output = attention_output.detach().float().mean(dim=(0, 2))
+        # Use the last query position's output (most informative for autoregressive;
+        # avoids meaningless averaging across positions with different context lengths)
+        output = attention_output.detach().float()[:, :, -1, :].mean(dim=0)  # [num_q_heads, head_dim]
 
         # If GQA, aggregate Q heads per KV head
         if num_kv_groups > 1:
@@ -101,15 +102,15 @@ class ImportanceScorer:
         v_deviation = V - output.unsqueeze(1)  # broadcast over kv_len
         v_deviation_norm = v_deviation.norm(dim=-1)  # [num_kv_heads, kv_len]
 
-        # Query norm: [num_q_heads, head_dim] -> [num_kv_heads]
-        Q = query_states.detach().float().mean(dim=(0, 2))  # [num_q_heads, head_dim]
+        # Query norm: use last query position (matching output above)
+        Q = query_states.detach().float()[:, :, -1, :].mean(dim=0)  # [num_q_heads, head_dim]
         if num_kv_groups > 1:
             Q = Q.view(self.num_kv_heads, num_kv_groups, -1).mean(dim=1)
         q_norm = Q.norm(dim=-1)  # [num_kv_heads]
         head_dim = Q.size(-1)
 
-        # Attention scores per KV head: [num_kv_heads, kv_len]
-        attn = attention_weights.detach().float().mean(dim=(0, 2))  # [num_q_heads, kv_len]
+        # Attention scores per KV head: use last query position
+        attn = attention_weights.detach().float()[:, :, -1, :].mean(dim=0)  # [num_q_heads, kv_len]
         if num_kv_groups > 1:
             attn = attn.view(self.num_kv_heads, num_kv_groups, -1).mean(dim=1)
 

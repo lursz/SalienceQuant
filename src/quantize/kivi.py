@@ -164,12 +164,22 @@ class KIVIQuantizedKVCache:
         self._cache.clear()
 
     def memory_bytes(self) -> int:
-        """Estimate total memory usage."""
+        """Estimate total logical memory usage.
+
+        Quantized tensors report logical packed size (e.g. 2-bit = 0.25 bytes/elem).
+        Scale and FP16 residual tensors report actual size.
+        """
         total = 0
         for entry in self._cache.values():
-            for key, val in entry.items():
-                if isinstance(val, torch.Tensor):
-                    total += val.nelement() * val.element_size()
+            # Quantized portion: logical packed size
+            if entry["quantized_k"] is not None:
+                total += entry["quantized_k"].nelement() * self.bits // 8
+                total += entry["quantized_v"].nelement() * self.bits // 8
+                total += entry["scale_k"].nelement() * entry["scale_k"].element_size()
+                total += entry["scale_v"].nelement() * entry["scale_v"].element_size()
+            # FP16 residual: actual size
+            total += entry["full_k"].nelement() * entry["full_k"].element_size()
+            total += entry["full_v"].nelement() * entry["full_v"].element_size()
         return total
 
     def memory_summary(self) -> dict:
@@ -179,10 +189,10 @@ class KIVIQuantizedKVCache:
 
         for entry in self._cache.values():
             if entry["quantized_k"] is not None:
-                for k in ["quantized_k", "scale_k", "quantized_v", "scale_v"]:
-                    t = entry[k]
-                    if isinstance(t, torch.Tensor):
-                        quantized_bytes += t.nelement() * t.element_size()
+                quantized_bytes += entry["quantized_k"].nelement() * self.bits // 8
+                quantized_bytes += entry["quantized_v"].nelement() * self.bits // 8
+                quantized_bytes += entry["scale_k"].nelement() * entry["scale_k"].element_size()
+                quantized_bytes += entry["scale_v"].nelement() * entry["scale_v"].element_size()
             for k in ["full_k", "full_v"]:
                 t = entry[k]
                 if isinstance(t, torch.Tensor):
