@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import torch
 
-from src.quantize.tiered import TierConfig, TIER_BITS, Tier
+from src.salience.tiered import TierConfig, TIER_BITS, Tier
 
 
 @dataclass

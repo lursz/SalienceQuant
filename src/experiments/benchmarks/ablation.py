@@ -14,13 +14,13 @@ Components ablated (in order):
 import torch
 from dataclasses import dataclass
 
-from src.quantize.uniform import quantize_symmetric, dequantize_symmetric
-from src.quantize.tiered import TierConfig, Tier, assign_tiers, TieredQuantizer
-from src.scoring.sink_detector import get_protected_mask
-from src.scoring.attention_tracker import AttentionTracker
-from src.scoring.importance import ImportanceScorer
-from src.experiments.capture import CapturedStates
-from src.experiments.metrics import compute_reconstruction_metrics, ReconstructionMetrics
+from src.shared.quantize import quantize_symmetric, dequantize_symmetric
+from src.salience.tiered import TierConfig, Tier, assign_tiers, TieredQuantizer
+from src.salience.scoring.sink_detector import get_protected_mask
+from src.salience.scoring.attention_tracker import AttentionTracker
+from src.salience.scoring.importance import ImportanceScorer
+from src.experiments.infra.capture import CapturedStates
+from src.experiments.infra.metrics import compute_reconstruction_metrics, ReconstructionMetrics
 
 
 @dataclass

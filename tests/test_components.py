@@ -8,7 +8,7 @@ import pytest
 
 class TestUniformQuantization:
     def test_symmetric_roundtrip_8bit(self):
-        from src.quantize.uniform import quantize_symmetric, dequantize_symmetric
+        from src.shared.quantize import quantize_symmetric, dequantize_symmetric
         x = torch.randn(2, 4, 128, 64)
         q, s = quantize_symmetric(x, bits=8, dim=-1)
         x_hat = dequantize_symmetric(q, s)
@@ -16,7 +16,7 @@ class TestUniformQuantization:
         assert (x - x_hat).abs().mean() < 0.01
 
     def test_symmetric_roundtrip_2bit(self):
-        from src.quantize.uniform import quantize_symmetric, dequantize_symmetric
+        from src.shared.quantize import quantize_symmetric, dequantize_symmetric
         x = torch.randn(2, 4, 128, 64)
         q, s = quantize_symmetric(x, bits=2, dim=-1)
         x_hat = dequantize_symmetric(q, s)
@@ -25,7 +25,7 @@ class TestUniformQuantization:
         assert (x - x_hat).abs().mean() < 1.0
 
     def test_asymmetric_roundtrip(self):
-        from src.quantize.uniform import quantize_asymmetric, dequantize_asymmetric
+        from src.shared.quantize import quantize_asymmetric, dequantize_asymmetric
         x = torch.randn(2, 4, 128, 64) + 2.0  # shifted distribution
         q, s, z = quantize_asymmetric(x, bits=8, dim=-1)
         x_hat = dequantize_asymmetric(q, s, z)
@@ -35,7 +35,7 @@ class TestUniformQuantization:
 
 class TestKIVIQuantization:
     def test_basic_flow(self):
-        from src.quantize.kivi import KIVIQuantizedKVCache
+        from src.kivi.cache import KIVIQuantizedKVCache
         cache = KIVIQuantizedKVCache(bits=4, residual_length=32)
         k = torch.randn(1, 2, 128, 64)
         v = torch.randn(1, 2, 128, 64)
@@ -45,7 +45,7 @@ class TestKIVIQuantization:
         assert v_out.shape == v.shape
 
     def test_residual_preserved(self):
-        from src.quantize.kivi import KIVIQuantizedKVCache
+        from src.kivi.cache import KIVIQuantizedKVCache
         cache = KIVIQuantizedKVCache(bits=2, residual_length=32)
         k = torch.randn(1, 2, 128, 64)
         v = torch.randn(1, 2, 128, 64)
@@ -56,8 +56,8 @@ class TestKIVIQuantization:
 
     def test_kivi_beats_uniform_on_values(self):
         """KIVI's per-token V quantization should beat uniform's per-tensor."""
-        from src.quantize.kivi import KIVIQuantizedKVCache
-        from src.quantize.uniform import UniformQuantizedKVCache
+        from src.kivi.cache import KIVIQuantizedKVCache
+        from src.shared.quantize import UniformQuantizedKVCache
         k = torch.randn(1, 2, 512, 64)
         v = torch.randn(1, 2, 512, 64)
 
@@ -80,7 +80,7 @@ class TestKIVIQuantization:
 
 class TestAttentionTracker:
     def test_basic_tracking(self):
-        from src.scoring.attention_tracker import AttentionTracker
+        from src.salience.scoring.attention_tracker import AttentionTracker
         tracker = AttentionTracker(num_layers=2, num_kv_heads=2, alpha=0.3)
 
         # Simulate attention weights: [batch=1, q_heads=4, q_len=1, kv_len=10]
@@ -92,7 +92,7 @@ class TestAttentionTracker:
         assert importance.sum() > 0
 
     def test_ema_decay(self):
-        from src.scoring.attention_tracker import AttentionTracker
+        from src.salience.scoring.attention_tracker import AttentionTracker
         tracker = AttentionTracker(num_layers=1, num_kv_heads=1, alpha=0.5)
 
         # First step: token 0 gets all attention
@@ -116,7 +116,7 @@ class TestAttentionTracker:
 
 class TestImportanceScorer:
     def test_value_importance_uses_attention(self):
-        from src.scoring.importance import ImportanceScorer
+        from src.salience.scoring.importance import ImportanceScorer
         scorer = ImportanceScorer(num_layers=1, num_kv_heads=2, alpha=0.5)
 
         attn = torch.softmax(torch.randn(1, 4, 1, 20), dim=-1)
@@ -126,7 +126,7 @@ class TestImportanceScorer:
         assert val_imp.shape == (20,)
 
     def test_key_importance_with_v_deviation(self):
-        from src.scoring.importance import ImportanceScorer
+        from src.salience.scoring.importance import ImportanceScorer
         scorer = ImportanceScorer(num_layers=1, num_kv_heads=2, alpha=0.5)
 
         batch, q_heads, kv_heads, seq_len, head_dim = 1, 4, 2, 20, 64
@@ -144,7 +144,7 @@ class TestImportanceScorer:
 
     def test_v_deviation_matters(self):
         """Tokens with unusual Values should get higher Key importance."""
-        from src.scoring.importance import ImportanceScorer
+        from src.salience.scoring.importance import ImportanceScorer
         scorer = ImportanceScorer(num_layers=1, num_kv_heads=1, alpha=1.0)
 
         seq_len, head_dim = 10, 64
@@ -172,13 +172,13 @@ class TestImportanceScorer:
 
 class TestSinkDetector:
     def test_sink_mask(self):
-        from src.scoring.sink_detector import get_sink_mask
+        from src.salience.scoring.sink_detector import get_sink_mask
         mask = get_sink_mask(100, num_sink_tokens=4)
         assert mask[:4].all()
         assert not mask[4:].any()
 
     def test_protected_mask(self):
-        from src.scoring.sink_detector import get_protected_mask
+        from src.salience.scoring.sink_detector import get_protected_mask
         mask = get_protected_mask(200, num_sink_tokens=4, recent_window=32)
         assert mask[:4].all()      # sinks
         assert mask[-32:].all()    # recent
@@ -189,7 +189,7 @@ class TestSinkDetector:
 
 class TestTieredQuantizer:
     def test_tier_assignment(self):
-        from src.quantize.tiered import assign_tiers, TierConfig, Tier
+        from src.salience.tiered import assign_tiers, TierConfig, Tier
         scores = torch.arange(100, dtype=torch.float)  # 0..99
         protected = torch.zeros(100, dtype=torch.bool)
         protected[:4] = True  # sinks
@@ -202,7 +202,7 @@ class TestTieredQuantizer:
         assert tiers[99] == Tier.FP16  # top token
 
     def test_quantize_dequantize_roundtrip(self):
-        from src.quantize.tiered import TieredQuantizer, assign_tiers, TierConfig
+        from src.salience.tiered import TieredQuantizer, assign_tiers, TierConfig
         k = torch.randn(1, 2, 100, 64)
         v = torch.randn(1, 2, 100, 64)
 
@@ -228,7 +228,7 @@ class TestTieredQuantizer:
             )
 
     def test_memory_savings(self):
-        from src.quantize.tiered import TieredQuantizer, assign_tiers, TierConfig
+        from src.salience.tiered import TieredQuantizer, assign_tiers, TierConfig
         k = torch.randn(1, 2, 1000, 64)
         v = torch.randn(1, 2, 1000, 64)
 
@@ -251,7 +251,7 @@ class TestTieredQuantizer:
 
 class TestSalienceCache:
     def test_basic_flow(self):
-        from src.cache.salience_cache import SalienceCache
+        from src.salience.cache import SalienceCache
         cache = SalienceCache(
             num_layers=2,
             num_kv_heads=2,
@@ -279,9 +279,9 @@ class TestSalienceCache:
 
     def test_with_per_layer_configs(self):
         """Test SalienceCache with per-layer tier configs from budget optimizer."""
-        from src.cache.salience_cache import SalienceCache
-        from src.quantize.tiered import TierConfig
-        from src.budget import optimize_tier_configs
+        from src.salience.cache import SalienceCache
+        from src.salience.tiered import TierConfig
+        from src.salience.budget.optimizer import optimize_tier_configs
 
         num_layers = 4
         # Fake sensitivity: layers 0 and 3 are most sensitive
@@ -313,8 +313,8 @@ class TestSalienceCache:
 
     def test_with_fisher_weights(self):
         """Test SalienceCache with Fisher channel weights."""
-        from src.cache.salience_cache import SalienceCache
-        from src.scoring.fisher import FisherChannelWeights
+        from src.salience.cache import SalienceCache
+        from src.salience.scoring.fisher import FisherChannelWeights
 
         num_layers, num_kv_heads, head_dim = 2, 2, 32
 
@@ -355,7 +355,7 @@ class TestSalienceCache:
 
 class TestBudget:
     def test_layer_bit_budget(self):
-        from src.budget import compute_layer_bit_budget
+        from src.salience.budget.optimizer import compute_layer_bit_budget
         sensitivity = {0: 1.0, 1: 0.1, 2: 0.5, 3: 0.8}
         bits = compute_layer_bit_budget(4, sensitivity, target_avg_bits=4.0)
 
@@ -367,7 +367,7 @@ class TestBudget:
         assert abs(avg - 4.0) < 0.5
 
     def test_bits_to_tier_config(self):
-        from src.budget import bits_to_tier_config
+        from src.salience.budget.optimizer import bits_to_tier_config
         # At 2 bits: almost all INT2
         config_2 = bits_to_tier_config(2.0)
         assert config_2.int2_pct > 0.9
@@ -387,8 +387,8 @@ class TestBudget:
             assert abs(actual - target) < 0.01, f"target={target}, actual={actual}"
 
     def test_optimize_tier_configs(self):
-        from src.budget import optimize_tier_configs
-        from src.quantize.tiered import TierConfig
+        from src.salience.budget.optimizer import optimize_tier_configs
+        from src.salience.tiered import TierConfig
         sensitivity = {0: 1.0, 1: 0.1, 2: 0.3, 3: 0.7}
         configs = optimize_tier_configs(4, sensitivity, target_avg_bits=4.0)
 
@@ -399,7 +399,7 @@ class TestBudget:
             assert abs(total - 1.0) < 0.01
 
     def test_sensitive_layers_get_more_fp16(self):
-        from src.budget import optimize_tier_configs
+        from src.salience.budget.optimizer import optimize_tier_configs
         sensitivity = {0: 1.0, 1: 0.01}
         configs = optimize_tier_configs(2, sensitivity, target_avg_bits=4.0)
         # Layer 0 (sensitive) should have more FP16 than layer 1
@@ -410,7 +410,7 @@ class TestBudget:
 
 class TestFisherWeights:
     def test_channel_weights_normalized(self):
-        from src.scoring.fisher import FisherChannelWeights
+        from src.salience.scoring.fisher import FisherChannelWeights
         data = {
             0: {
                 "key_fisher": torch.tensor([[1.0, 5.0, 3.0, 2.0]]),
@@ -425,7 +425,7 @@ class TestFisherWeights:
         assert weights[0, 1] == 1.0
 
     def test_save_load(self, tmp_path):
-        from src.scoring.fisher import FisherChannelWeights
+        from src.salience.scoring.fisher import FisherChannelWeights
         data = {
             0: {
                 "key_fisher": torch.rand(2, 64),

@@ -8,7 +8,7 @@ import torch
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.eval import load_wikitext2
+from src.shared.eval import load_wikitext2
 
 
 @dataclass

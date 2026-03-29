@@ -8,11 +8,11 @@ Usage:
 import argparse
 import torch
 
-from src.models import load_model, get_model_config
-from src.eval import evaluate_perplexity
-from src.profiling import profile_gpu, estimate_kv_cache_size_mb
-from src.quantize.uniform import UniformQuantizedKVCache
-from src.quantize.kivi import KIVIQuantizedKVCache
+from src.shared.models import load_model, get_model_config
+from src.shared.eval import evaluate_perplexity
+from src.shared.profiling import profile_gpu, estimate_kv_cache_size_mb
+from src.shared.quantize import UniformQuantizedKVCache
+from src.kivi.cache import KIVIQuantizedKVCache
 
 
 def test_quantize(model_size: str = "0.5b"):

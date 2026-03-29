@@ -7,7 +7,7 @@ without modifying the model.
 
 import torch
 
-from src.quantize.uniform import quantize_symmetric, dequantize_symmetric
+from src.shared.quantize import quantize_symmetric, dequantize_symmetric
 
 
 def make_proj_quant_hook(bits: int, num_kv_heads: int, head_dim: int, quant_dim: int):

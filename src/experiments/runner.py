@@ -14,15 +14,15 @@ from pathlib import Path
 
 import torch
 
-from src.experiments.capture import generate_synthetic_states, capture_states
-from src.experiments.reconstruction import (
+from src.experiments.infra.capture import generate_synthetic_states, capture_states
+from src.experiments.benchmarks.reconstruction import (
     run_reconstruction_comparison,
     eval_salience,
     format_results_table,
 )
-from src.experiments.ablation import run_ablation, format_ablation_table
-from src.experiments.perplexity import run_ppl_comparison, format_ppl_table
-from src.quantize.tiered import TierConfig
+from src.experiments.benchmarks.ablation import run_ablation, format_ablation_table
+from src.experiments.benchmarks.perplexity import run_ppl_comparison, format_ppl_table
+from src.salience.tiered import TierConfig
 
 
 def _load_states(args):
@@ -42,7 +42,7 @@ def _load_states(args):
         )
         return states, args.num_kv_heads, args.num_q_heads
 
-    from src.models import load_model, get_model_config
+    from src.shared.models import load_model, get_model_config
     print(f"Loading model: {args.model}...")
     model, tokenizer = load_model(args.model, device=args.device)
     config = get_model_config(model)
@@ -88,7 +88,7 @@ def run_ablation_experiment(args):
     # Optionally generate per-layer budget from sensitivity profile
     per_layer_configs = None
     if not args.no_budget and args.sensitivity_path:
-        from src.budget import optimize_tier_configs
+        from src.salience.budget.optimizer import optimize_tier_configs
         with open(args.sensitivity_path) as f:
             sensitivity = {int(k): v for k, v in json.load(f).items()}
         per_layer_configs = optimize_tier_configs(
@@ -119,7 +119,7 @@ def run_perplexity_experiment(args):
     print("PERPLEXITY EVALUATION")
     print("=" * 70)
 
-    from src.models import load_model
+    from src.shared.models import load_model
     print(f"Loading model: {args.model}...")
     model, tokenizer = load_model(args.model, device=args.device)
 

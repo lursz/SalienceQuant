@@ -7,10 +7,10 @@ participate in attention, accurately simulating KV cache quantization.
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.eval import load_wikitext2, evaluate_perplexity
-from src.quantize.uniform import quantize_symmetric, dequantize_symmetric
-from src.quantize.hooks import make_proj_quant_hook, make_residual_proj_hook
-from src.quantize.tiered import TierConfig, apply_tiered_quant
+from src.shared.eval import load_wikitext2, evaluate_perplexity
+from src.shared.quantize import quantize_symmetric, dequantize_symmetric
+from src.shared.hooks import make_proj_quant_hook, make_residual_proj_hook
+from src.salience.tiered import TierConfig, apply_tiered_quant
 
 
 def _get_kv_config(model: AutoModelForCausalLM) -> tuple[int, int]:

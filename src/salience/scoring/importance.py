@@ -14,7 +14,7 @@ For Keys:
 """
 
 import torch
-from src.scoring.attention_tracker import AttentionTracker
+from src.salience.scoring.attention_tracker import AttentionTracker
 
 
 class ImportanceScorer:

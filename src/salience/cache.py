@@ -9,10 +9,10 @@ Combines all components:
 
 import torch
 
-from src.scoring.importance import ImportanceScorer
-from src.scoring.fisher import FisherChannelWeights
-from src.scoring.sink_detector import get_protected_mask
-from src.quantize.tiered import Tier, TieredQuantizer, TierConfig, assign_tiers
+from src.salience.scoring.importance import ImportanceScorer
+from src.salience.scoring.fisher import FisherChannelWeights
+from src.salience.scoring.sink_detector import get_protected_mask
+from src.salience.tiered import Tier, TieredQuantizer, TierConfig, assign_tiers
 
 
 class SalienceCache:

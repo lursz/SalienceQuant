@@ -12,7 +12,7 @@ This serves as a strong baseline for SalienceQuant.
 
 import torch
 
-from src.quantize.uniform import quantize_symmetric, dequantize_symmetric
+from src.shared.quantize import quantize_symmetric, dequantize_symmetric
 
 
 class KIVIQuantizedKVCache:

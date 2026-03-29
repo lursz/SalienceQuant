@@ -6,7 +6,7 @@ import pytest
 
 class TestMetrics:
     def test_compute_mse(self):
-        from src.experiments.metrics import compute_mse
+        from src.experiments.infra.metrics import compute_mse
         ref = torch.randn(2, 4, 128, 64)
         # Perfect reconstruction
         assert compute_mse(ref, ref) == 0.0
@@ -16,7 +16,7 @@ class TestMetrics:
         assert 0.005 < mse < 0.02
 
     def test_cosine_similarity(self):
-        from src.experiments.metrics import compute_cosine_similarity
+        from src.experiments.infra.metrics import compute_cosine_similarity
         ref = torch.randn(2, 4, 128, 64)
         # Perfect match
         assert abs(compute_cosine_similarity(ref, ref) - 1.0) < 1e-5
@@ -25,14 +25,14 @@ class TestMetrics:
         assert compute_cosine_similarity(ref, noisy) > 0.9
 
     def test_relative_error(self):
-        from src.experiments.metrics import compute_relative_error
+        from src.experiments.infra.metrics import compute_relative_error
         ref = torch.randn(2, 4, 128, 64)
         assert compute_relative_error(ref, ref) == 0.0
         noisy = ref + torch.randn_like(ref) * 0.1
         assert 0 < compute_relative_error(ref, noisy) < 0.2
 
     def test_reconstruction_metrics(self):
-        from src.experiments.metrics import compute_reconstruction_metrics
+        from src.experiments.infra.metrics import compute_reconstruction_metrics
         k = torch.randn(1, 2, 64, 32)
         v = torch.randn(1, 2, 64, 32)
         m = compute_reconstruction_metrics(k, v, k, v, memory_bytes=1024)
@@ -45,7 +45,7 @@ class TestMetrics:
 
 class TestSyntheticCapture:
     def test_generate_synthetic_states(self):
-        from src.experiments.capture import generate_synthetic_states
+        from src.experiments.infra.capture import generate_synthetic_states
         states = generate_synthetic_states(
             num_layers=2, num_kv_heads=2, num_q_heads=4,
             seq_len=64, head_dim=32,
@@ -63,7 +63,7 @@ class TestSyntheticCapture:
         assert states.attention_weights[0].shape == (1, 4, 64, 64)
 
     def test_synthetic_attention_sums_to_one(self):
-        from src.experiments.capture import generate_synthetic_states
+        from src.experiments.infra.capture import generate_synthetic_states
         states = generate_synthetic_states(num_layers=1, seq_len=32)
         attn = states.attention_weights[0]
         # Each row should sum to ~1 (softmax)
@@ -73,16 +73,16 @@ class TestSyntheticCapture:
 
 class TestReconstruction:
     def test_fp16_baseline(self):
-        from src.experiments.capture import generate_synthetic_states
-        from src.experiments.reconstruction import eval_fp16_baseline
+        from src.experiments.infra.capture import generate_synthetic_states
+        from src.experiments.benchmarks.reconstruction import eval_fp16_baseline
         states = generate_synthetic_states(num_layers=2, seq_len=64)
         result = eval_fp16_baseline(states)
         assert result.metrics.key_mse == 0.0
         assert result.metrics.compression_ratio == 1.0
 
     def test_uniform_quantization(self):
-        from src.experiments.capture import generate_synthetic_states
-        from src.experiments.reconstruction import eval_uniform
+        from src.experiments.infra.capture import generate_synthetic_states
+        from src.experiments.benchmarks.reconstruction import eval_uniform
         states = generate_synthetic_states(num_layers=2, seq_len=64)
 
         r8 = eval_uniform(states, bits=8)
@@ -95,16 +95,16 @@ class TestReconstruction:
         assert r4.metrics.compression_ratio >= 1.0
 
     def test_kivi(self):
-        from src.experiments.capture import generate_synthetic_states
-        from src.experiments.reconstruction import eval_kivi
+        from src.experiments.infra.capture import generate_synthetic_states
+        from src.experiments.benchmarks.reconstruction import eval_kivi
         states = generate_synthetic_states(num_layers=2, seq_len=256)
         result = eval_kivi(states, bits=4, residual_length=64)
         assert result.metrics.key_mse > 0
         assert result.metrics.key_cosine_sim > 0.5
 
     def test_salience(self):
-        from src.experiments.capture import generate_synthetic_states
-        from src.experiments.reconstruction import eval_salience
+        from src.experiments.infra.capture import generate_synthetic_states
+        from src.experiments.benchmarks.reconstruction import eval_salience
         states = generate_synthetic_states(
             num_layers=2, num_kv_heads=2, num_q_heads=4, seq_len=256
         )
@@ -116,8 +116,8 @@ class TestReconstruction:
         assert result.metrics.compression_ratio > 1.0
 
     def test_full_comparison(self):
-        from src.experiments.capture import generate_synthetic_states
-        from src.experiments.reconstruction import run_reconstruction_comparison, format_results_table
+        from src.experiments.infra.capture import generate_synthetic_states
+        from src.experiments.benchmarks.reconstruction import run_reconstruction_comparison, format_results_table
         states = generate_synthetic_states(
             num_layers=2, num_kv_heads=2, num_q_heads=4, seq_len=256
         )
@@ -136,8 +136,8 @@ class TestReconstruction:
 
 class TestAblation:
     def test_ablation_runs(self):
-        from src.experiments.capture import generate_synthetic_states
-        from src.experiments.ablation import run_ablation, format_ablation_table
+        from src.experiments.infra.capture import generate_synthetic_states
+        from src.experiments.benchmarks.ablation import run_ablation, format_ablation_table
         states = generate_synthetic_states(
             num_layers=2, num_kv_heads=2, num_q_heads=4, seq_len=256
         )
@@ -157,9 +157,9 @@ class TestAblation:
         assert "Uniform INT4" in table
 
     def test_ablation_with_budget(self):
-        from src.experiments.capture import generate_synthetic_states
-        from src.experiments.ablation import run_ablation
-        from src.budget import optimize_tier_configs
+        from src.experiments.infra.capture import generate_synthetic_states
+        from src.experiments.benchmarks.ablation import run_ablation
+        from src.salience.budget.optimizer import optimize_tier_configs
         states = generate_synthetic_states(
             num_layers=2, num_kv_heads=2, num_q_heads=4, seq_len=256
         )
@@ -177,9 +177,9 @@ class TestAblation:
 class TestSweep:
     def test_sweep_configs(self):
         """Test that different tier configs produce different compression ratios."""
-        from src.experiments.capture import generate_synthetic_states
-        from src.experiments.reconstruction import eval_salience
-        from src.quantize.tiered import TierConfig
+        from src.experiments.infra.capture import generate_synthetic_states
+        from src.experiments.benchmarks.reconstruction import eval_salience
+        from src.salience.tiered import TierConfig
 
         states = generate_synthetic_states(
             num_layers=2, num_kv_heads=2, num_q_heads=4, seq_len=256

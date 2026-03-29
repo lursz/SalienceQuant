@@ -14,12 +14,12 @@ Methods compared:
 import torch
 from dataclasses import dataclass
 
-from src.quantize.uniform import quantize_symmetric, dequantize_symmetric
-from src.quantize.kivi import KIVIQuantizedKVCache
-from src.quantize.tiered import TierConfig
-from src.cache.salience_cache import SalienceCache
-from src.experiments.capture import CapturedStates
-from src.experiments.metrics import (
+from src.shared.quantize import quantize_symmetric, dequantize_symmetric
+from src.kivi.cache import KIVIQuantizedKVCache
+from src.salience.tiered import TierConfig
+from src.salience.cache import SalienceCache
+from src.experiments.infra.capture import CapturedStates
+from src.experiments.infra.metrics import (
     ReconstructionMetrics,
     compute_reconstruction_metrics,
 )

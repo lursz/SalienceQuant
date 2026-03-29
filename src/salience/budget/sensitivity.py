@@ -12,8 +12,8 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.eval import evaluate_perplexity
-from src.quantize.hooks import make_proj_quant_hook
+from src.shared.eval import evaluate_perplexity
+from src.shared.hooks import make_proj_quant_hook
 
 
 @torch.no_grad()
