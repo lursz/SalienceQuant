@@ -13,7 +13,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.eval import evaluate_perplexity
-from src.quantize.uniform import quantize_symmetric, dequantize_symmetric
+from src.quantize.hooks import make_proj_quant_hook
 
 
 @torch.no_grad()
@@ -70,11 +70,11 @@ def profile_layer_sensitivity(
         layer = model.model.layers[layer_idx]
         # K: per-channel quantization (dim=2)
         h_k = layer.self_attn.k_proj.register_forward_hook(
-            _make_proj_quant_hook(bits, num_kv_heads, head_dim, quant_dim=2)
+            make_proj_quant_hook(bits, num_kv_heads, head_dim, quant_dim=2)
         )
         # V: per-token quantization (dim=-1)
         h_v = layer.self_attn.v_proj.register_forward_hook(
-            _make_proj_quant_hook(bits, num_kv_heads, head_dim, quant_dim=-1)
+            make_proj_quant_hook(bits, num_kv_heads, head_dim, quant_dim=-1)
         )
 
         try:
@@ -106,68 +106,3 @@ def profile_layer_sensitivity(
     }
 
 
-def _make_proj_quant_hook(bits: int, num_kv_heads: int, head_dim: int, quant_dim: int):
-    """Create a forward hook that quantizes a K or V projection output.
-
-    Reshapes [batch, seq, kv_heads*head_dim] -> [batch, kv_heads, seq, head_dim],
-    quantizes along quant_dim, then reshapes back.
-
-    quant_dim=2  -> per-channel K (scale per head_dim channel, shared over seq)
-    quant_dim=-1 -> per-token V  (scale per token, shared over head_dim)
-    """
-    def hook_fn(module, args, output):
-        batch, seq_len, _ = output.shape
-        out = output.view(batch, seq_len, num_kv_heads, head_dim).transpose(1, 2)
-        q, s = quantize_symmetric(out, bits=bits, dim=quant_dim)
-        dequant = dequantize_symmetric(q, s).to(output.dtype)
-        return dequant.transpose(1, 2).contiguous().view(batch, seq_len, num_kv_heads * head_dim)
-    return hook_fn
-
-
-def sensitivity_to_tier_configs(
-    layer_sensitivity_normalized: dict[int, float],
-    base_fp16_pct: float = 0.05,
-    base_int8_pct: float = 0.15,
-    base_int4_pct: float = 0.30,
-    sensitivity_scale: float = 0.15,
-) -> dict[int, dict[str, float]]:
-    """Convert per-layer sensitivity into per-layer tier configurations.
-
-    More sensitive layers get more tokens in higher-precision tiers.
-
-    Args:
-        layer_sensitivity_normalized: Per-layer sensitivity in [0, 1].
-        base_fp16_pct: Base FP16 percentage for least sensitive layer.
-        base_int8_pct: Base INT8 percentage.
-        base_int4_pct: Base INT4 percentage.
-        sensitivity_scale: How much to scale up high-precision tiers for
-            sensitive layers. A layer with sensitivity=1.0 gets
-            base_pct + sensitivity_scale more FP16 tokens.
-
-    Returns:
-        Dict mapping layer_idx -> dict with "fp16_pct", "int8_pct", "int4_pct".
-    """
-    configs = {}
-    for layer_idx, sens in layer_sensitivity_normalized.items():
-        # More sensitive -> more FP16 and INT8
-        fp16_bonus = sensitivity_scale * sens
-        int8_bonus = sensitivity_scale * sens * 0.5
-
-        fp16_pct = base_fp16_pct + fp16_bonus
-        int8_pct = base_int8_pct + int8_bonus
-        int4_pct = base_int4_pct
-
-        # Ensure percentages don't exceed 1.0
-        total = fp16_pct + int8_pct + int4_pct
-        if total > 0.95:
-            scale = 0.95 / total
-            fp16_pct *= scale
-            int8_pct *= scale
-            int4_pct *= scale
-
-        configs[layer_idx] = {
-            "fp16_pct": fp16_pct,
-            "int8_pct": int8_pct,
-            "int4_pct": int4_pct,
-        }
-    return configs

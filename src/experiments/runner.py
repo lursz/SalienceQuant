@@ -17,6 +17,7 @@ import torch
 from src.experiments.capture import generate_synthetic_states, capture_states
 from src.experiments.reconstruction import (
     run_reconstruction_comparison,
+    eval_salience,
     format_results_table,
 )
 from src.experiments.ablation import run_ablation, format_ablation_table
@@ -24,12 +25,12 @@ from src.experiments.perplexity import run_ppl_comparison, format_ppl_table
 from src.quantize.tiered import TierConfig
 
 
-def run_reconstruction_experiment(args):
-    """Run reconstruction quality comparison."""
-    print("=" * 70)
-    print("RECONSTRUCTION QUALITY EXPERIMENT")
-    print("=" * 70)
+def _load_states(args):
+    """Load captured states from synthetic data or a real model.
 
+    Returns:
+        (states, num_kv_heads, num_attention_heads)
+    """
     if args.synthetic:
         print(f"Using synthetic data: {args.num_layers} layers, seq_len={args.seq_len}")
         states = generate_synthetic_states(
@@ -39,20 +40,28 @@ def run_reconstruction_experiment(args):
             seq_len=args.seq_len,
             head_dim=args.head_dim,
         )
-        num_kv_heads = args.num_kv_heads
-        num_attention_heads = args.num_q_heads
-    else:
-        from src.models import load_model, get_model_config
-        print(f"Loading model: {args.model}...")
-        model, tokenizer = load_model(args.model, device=args.device)
-        config = get_model_config(model)
-        num_kv_heads = config["num_kv_heads"]
-        num_attention_heads = config["num_attention_heads"]
+        return states, args.num_kv_heads, args.num_q_heads
 
-        print(f"Capturing states (seq_len={args.seq_len})...")
-        states = capture_states(model, tokenizer, seq_len=args.seq_len, device=args.device)
-        del model  # free memory
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    from src.models import load_model, get_model_config
+    print(f"Loading model: {args.model}...")
+    model, tokenizer = load_model(args.model, device=args.device)
+    config = get_model_config(model)
+
+    print(f"Capturing states (seq_len={args.seq_len})...")
+    states = capture_states(model, tokenizer, seq_len=args.seq_len, device=args.device)
+    del model
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    return states, config["num_kv_heads"], config["num_attention_heads"]
+
+
+def run_reconstruction_experiment(args):
+    """Run reconstruction quality comparison."""
+    print("=" * 70)
+    print("RECONSTRUCTION QUALITY EXPERIMENT")
+    print("=" * 70)
+
+    states, num_kv_heads, num_attention_heads = _load_states(args)
 
     print(f"\nRunning {len(states.keys)} layers...\n")
     start = time.perf_counter()
@@ -74,37 +83,12 @@ def run_ablation_experiment(args):
     print("ABLATION STUDY")
     print("=" * 70)
 
-    if args.synthetic:
-        print(f"Using synthetic data: {args.num_layers} layers, seq_len={args.seq_len}")
-        states = generate_synthetic_states(
-            num_layers=args.num_layers,
-            num_kv_heads=args.num_kv_heads,
-            num_q_heads=args.num_q_heads,
-            seq_len=args.seq_len,
-            head_dim=args.head_dim,
-        )
-        num_kv_heads = args.num_kv_heads
-        num_attention_heads = args.num_q_heads
-    else:
-        from src.models import load_model, get_model_config
-        print(f"Loading model: {args.model}...")
-        model, tokenizer = load_model(args.model, device=args.device)
-        config = get_model_config(model)
-        num_kv_heads = config["num_kv_heads"]
-        num_attention_heads = config["num_attention_heads"]
+    states, num_kv_heads, num_attention_heads = _load_states(args)
 
-        print(f"Capturing states (seq_len={args.seq_len})...")
-        states = capture_states(model, tokenizer, seq_len=args.seq_len, device=args.device)
-        del model
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-    # Optionally generate per-layer budget
-    # Note: without real sensitivity profiling, we skip per-layer budget
-    # since uniform sensitivity produces identical configs across layers.
+    # Optionally generate per-layer budget from sensitivity profile
     per_layer_configs = None
-    if not args.no_budget and hasattr(args, 'sensitivity_path') and args.sensitivity_path:
+    if not args.no_budget and args.sensitivity_path:
         from src.budget import optimize_tier_configs
-        import json
         with open(args.sensitivity_path) as f:
             sensitivity = {int(k): v for k, v in json.load(f).items()}
         per_layer_configs = optimize_tier_configs(
@@ -130,7 +114,7 @@ def run_ablation_experiment(args):
 
 
 def run_perplexity_experiment(args):
-    """Run perplexity comparison (requires GPU + model)."""
+    """Run perplexity comparison (requires model)."""
     print("=" * 70)
     print("PERPLEXITY EVALUATION")
     print("=" * 70)
@@ -162,30 +146,8 @@ def run_sweep_experiment(args):
     print("TIER CONFIG SWEEP (Pareto frontier)")
     print("=" * 70)
 
-    if args.synthetic:
-        states = generate_synthetic_states(
-            num_layers=args.num_layers,
-            num_kv_heads=args.num_kv_heads,
-            num_q_heads=args.num_q_heads,
-            seq_len=args.seq_len,
-            head_dim=args.head_dim,
-        )
-        num_kv_heads = args.num_kv_heads
-        num_attention_heads = args.num_q_heads
-    else:
-        from src.models import load_model, get_model_config
-        print(f"Loading model: {args.model}...")
-        model, tokenizer = load_model(args.model, device=args.device)
-        config = get_model_config(model)
-        num_kv_heads = config["num_kv_heads"]
-        num_attention_heads = config["num_attention_heads"]
-        states = capture_states(model, tokenizer, seq_len=args.seq_len, device=args.device)
-        del model
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    states, num_kv_heads, num_attention_heads = _load_states(args)
 
-    from src.experiments.reconstruction import eval_salience
-
-    # Sweep configurations: (fp16_pct, int8_pct, int4_pct)
     configs = [
         ("2-bit avg",   TierConfig(fp16_pct=0.00, int8_pct=0.00, int4_pct=0.00)),
         ("~2.5-bit",    TierConfig(fp16_pct=0.02, int8_pct=0.03, int4_pct=0.10)),

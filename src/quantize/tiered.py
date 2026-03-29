@@ -294,3 +294,55 @@ class TieredQuantizer:
             for tier in Tier
             if tier in self._key_tier_indices
         }
+
+
+def apply_tiered_quant(
+    tensor: torch.Tensor,
+    importance: torch.Tensor,
+    config: TierConfig,
+    quant_dim: int,
+) -> torch.Tensor:
+    """Apply tiered quantization to a KV tensor based on per-token importance.
+
+    Splits tokens into FP16/INT8/INT4/INT2 tiers by importance rank,
+    quantizes each tier independently, and reassembles.
+
+    Args:
+        tensor: [batch, kv_heads, seq_len, head_dim]
+        importance: [seq_len] importance scores
+        config: Tier percentages
+        quant_dim: Quantization dimension within each tier.
+            2  -> per-channel (for Keys)
+            -1 -> per-token  (for Values)
+
+    Returns:
+        Tensor with same shape, quantized per-tier.
+    """
+    dtype = tensor.dtype
+    seq_len = tensor.size(2)
+    result = tensor.clone()
+
+    sorted_idx = importance.argsort(descending=True)
+    n_fp16 = max(4, int(seq_len * config.fp16_pct))
+    n_int8 = int(seq_len * config.int8_pct)
+    n_int4 = int(seq_len * config.int4_pct)
+
+    def quant_tokens(idx, bits):
+        chunk = tensor[:, :, idx, :]
+        q, s = quantize_symmetric(chunk, bits=bits, dim=quant_dim)
+        return dequantize_symmetric(q, s).to(dtype)
+
+    if n_int8 > 0:
+        idx = sorted_idx[n_fp16:n_fp16 + n_int8]
+        result[:, :, idx, :] = quant_tokens(idx, 8)
+
+    if n_int4 > 0:
+        idx = sorted_idx[n_fp16 + n_int8:n_fp16 + n_int8 + n_int4]
+        result[:, :, idx, :] = quant_tokens(idx, 4)
+
+    int2_start = n_fp16 + n_int8 + n_int4
+    if int2_start < seq_len:
+        idx = sorted_idx[int2_start:]
+        result[:, :, idx, :] = quant_tokens(idx, 2)
+
+    return result

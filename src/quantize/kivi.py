@@ -152,14 +152,6 @@ class KIVIQuantizedKVCache:
 
         return keys, values
 
-    def seq_len(self, layer_idx: int) -> int:
-        """Get total sequence length for a layer."""
-        entry = self._cache[layer_idx]
-        total = entry["full_k"].size(2)
-        if entry["quantized_k"] is not None:
-            total += entry["quantized_k"].size(2)
-        return total
-
     def clear(self):
         self._cache.clear()
 

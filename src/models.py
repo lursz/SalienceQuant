@@ -1,7 +1,4 @@
-"""Model loading utilities for Qwen with HuggingFace Transformers.
-
-Provides helpers to load Qwen models and register hooks for KV cache access.
-"""
+"""Model loading utilities for Qwen with HuggingFace Transformers."""
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -67,58 +64,3 @@ def get_model_config(model: AutoModelForCausalLM) -> dict:
     }
 
 
-class AttentionHook:
-    """Hook to capture attention weights from model layers.
-
-    Registers forward hooks on attention layers to capture attention weights
-    (after softmax) when output_attentions=True.
-
-    For full K/V/Q capture, use src.experiments.capture.capture_states instead.
-    """
-
-    def __init__(self, model: AutoModelForCausalLM):
-        self.model = model
-        self.attention_weights: dict[int, torch.Tensor] = {}
-        self._hooks: list = []
-
-    def register(self, layer_indices: list[int] | None = None):
-        """Register hooks on attention layers.
-
-        Args:
-            layer_indices: Which layers to hook. None = all layers.
-        """
-        self.clear()
-        layers = self.model.model.layers
-
-        if layer_indices is None:
-            layer_indices = list(range(len(layers)))
-
-        for idx in layer_indices:
-            layer = layers[idx]
-            hook = layer.self_attn.register_forward_hook(
-                self._make_hook(idx), with_kwargs=True
-            )
-            self._hooks.append(hook)
-
-    def _make_hook(self, layer_idx: int):
-        def hook_fn(module, args, kwargs, output):
-            # HF transformers returns (attn_output, attn_weights, past_key_value)
-            # when output_attentions=True
-            if isinstance(output, tuple) and len(output) >= 2:
-                attn_output = output[0]
-                attn_weights = output[1]
-                if attn_weights is not None:
-                    self.attention_weights[layer_idx] = attn_weights.detach()
-            return output
-
-        return hook_fn
-
-    def clear(self):
-        """Remove all hooks and clear stored states."""
-        for hook in self._hooks:
-            hook.remove()
-        self._hooks.clear()
-        self.attention_weights.clear()
-
-    def __del__(self):
-        self.clear()

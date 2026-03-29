@@ -185,18 +185,6 @@ class FisherChannelWeights:
             return torch.ones_like(fisher)
         return (fisher - fmin) / (fmax - fmin)
 
-    def get_channel_importance_ranking(
-        self, layer_idx: int, kv_type: str = "key"
-    ) -> torch.Tensor:
-        """Get channel indices sorted by Fisher importance (most important first).
-
-        Returns:
-            [num_kv_heads, head_dim] tensor of indices.
-        """
-        weights = self.get_channel_weights(layer_idx, kv_type)
-        # Sort per head
-        return weights.argsort(dim=-1, descending=True)
-
     @property
     def num_layers(self) -> int:
         return len(self._data)
