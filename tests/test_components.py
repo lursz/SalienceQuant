@@ -33,6 +33,49 @@ class TestUniformQuantization:
         assert (x - x_hat).abs().mean() < 0.1
 
 
+class TestGroupedQuantization:
+    def test_roundtrip_shape_and_arbitrary_length(self):
+        from src.shared.quantize import quantize_grouped, dequantize_grouped
+        # length not divisible by group_size must still round-trip exactly in shape
+        x = torch.randn(1, 2, 130, 64)
+        gq = quantize_grouped(x, bits=4, axis=2, group_size=64)
+        x_hat = dequantize_grouped(gq)
+        assert x_hat.shape == x.shape
+
+    def test_grouping_beats_whole_axis_at_2bit(self):
+        """The core fix: a per-channel scale spanning all tokens is catastrophic
+        at 2-bit; group-wise quantization is far better."""
+        from src.shared.quantize import (
+            quantize_symmetric, dequantize_symmetric,
+            quantize_grouped, dequantize_grouped,
+        )
+        # Keys with per-channel outliers + drift across the long token axis
+        x = torch.randn(1, 2, 512, 64)
+        x[:, :, :, ::8] *= 6.0
+        x = x + torch.linspace(-3, 3, 512).view(1, 1, 512, 1)
+
+        q, s = quantize_symmetric(x, bits=2, dim=2)  # one scale per channel, all tokens
+        whole_err = (x - dequantize_symmetric(q, s)).pow(2).mean().item()
+        grouped_err = (x - dequantize_grouped(
+            quantize_grouped(x, bits=2, axis=2, group_size=64))).pow(2).mean().item()
+
+        assert grouped_err < whole_err / 3, (grouped_err, whole_err)
+
+    def test_memory_bytes_matches_logical_size(self):
+        """Regression: memory_bytes must not double-count by n_groups."""
+        from src.shared.quantize import quantize_grouped
+        x = torch.randn(1, 2, 256, 64)  # 32768 real elements
+        gq = quantize_grouped(x, bits=4, axis=2, group_size=64)
+        codes_bytes = 32768 * 4 // 8  # 4-bit packed
+        # scale + zp overhead is small; total should be within a modest margin
+        assert codes_bytes <= gq.memory_bytes() < codes_bytes * 1.5
+
+    def test_effective_bits_overhead(self):
+        from src.shared.quantize import grouped_effective_bits
+        assert grouped_effective_bits(2, 64, asymmetric=True) == 2 + 32 / 64
+        assert grouped_effective_bits(4, 128, asymmetric=False) == 4 + 16 / 128
+
+
 class TestKIVIQuantization:
     def test_basic_flow(self):
         from src.kivi.cache import KIVIQuantizedKVCache

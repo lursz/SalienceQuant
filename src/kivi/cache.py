@@ -12,29 +12,33 @@ This serves as a strong baseline for SalienceQuant.
 
 import torch
 
-from src.shared.quantize import quantize_symmetric, dequantize_symmetric
+from src.shared.quantize import quantize_grouped, dequantize_grouped
 
 
 class KIVIQuantizedKVCache:
     """KIVI: Asymmetric quantization granularity for Keys and Values.
 
-    Keys use per-channel quantization (scale per channel across all tokens).
-    Values use per-token quantization (scale per token across all channels).
-    Recent tokens are kept in full FP16 precision.
+    Keys use per-channel quantization (group-wise along the token axis).
+    Values use per-token quantization (group-wise along the head_dim axis).
+    Both are group-wise asymmetric — a single scale spanning all tokens cannot
+    represent a channel's range at low bit-widths. Recent tokens stay in FP16.
     """
 
     def __init__(
         self,
         bits: int = 2,
         residual_length: int = 128,
+        group_size: int = 64,
     ):
         """
         Args:
             bits: Quantization bit-width for the quantized portion.
             residual_length: Number of recent tokens to keep in FP16.
+            group_size: Quantization group size.
         """
         self.bits = bits
         self.residual_length = residual_length
+        self.group_size = group_size
 
         # Per layer: (quantized_k, scale_k, quantized_v, scale_v, residual_k, residual_v)
         self._cache: dict[int, dict] = {}
@@ -57,10 +61,8 @@ class KIVIQuantizedKVCache:
             self._cache[layer_idx] = {
                 "full_k": key_states,
                 "full_v": value_states,
-                "quantized_k": None,
-                "scale_k": None,
-                "quantized_v": None,
-                "scale_v": None,
+                "gq_k": None,
+                "gq_v": None,
             }
             self._maybe_quantize(layer_idx)
             return
@@ -86,44 +88,14 @@ class KIVIQuantizedKVCache:
         k_to_quant = entry["full_k"][:, :, :quant_len, :]
         v_to_quant = entry["full_v"][:, :, :quant_len, :]
 
-        # Keys: per-channel quantization (dim=2, i.e., across seq_len)
-        # Shape: [batch, heads, seq_len, head_dim] -> scale shape: [batch, heads, 1, head_dim]
-        q_k, s_k = self._quantize_keys(k_to_quant)
-
-        # Values: per-token quantization (dim=3, i.e., across head_dim)
-        # Shape: [batch, heads, seq_len, head_dim] -> scale shape: [batch, heads, seq_len, 1]
-        q_v, s_v = self._quantize_values(v_to_quant)
-
-        entry["quantized_k"] = q_k
-        entry["scale_k"] = s_k
-        entry["quantized_v"] = q_v
-        entry["scale_v"] = s_v
+        # Keys: per-channel — group-wise along the token axis (dim=2).
+        # Values: per-token — group-wise along the head_dim axis (dim=3).
+        entry["gq_k"] = quantize_grouped(k_to_quant, self.bits, axis=2, group_size=self.group_size)
+        entry["gq_v"] = quantize_grouped(v_to_quant, self.bits, axis=3, group_size=self.group_size)
 
         # Keep only residual portion in full precision
         entry["full_k"] = entry["full_k"][:, :, quant_len:, :]
         entry["full_v"] = entry["full_v"][:, :, quant_len:, :]
-
-    def _quantize_keys(
-        self, keys: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-channel quantization for Keys.
-
-        Quantizes along the seq_len dimension (dim=2), so each channel (head_dim)
-        gets its own scale factor computed across all tokens.
-        """
-        # Per-channel: scale computed across seq_len for each (batch, head, channel)
-        return quantize_symmetric(keys, self.bits, dim=2)
-
-    def _quantize_values(
-        self, values: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-token quantization for Values.
-
-        Quantizes along the head_dim dimension (dim=3), so each token gets its
-        own scale factor computed across all channels.
-        """
-        # Per-token: scale computed across head_dim for each (batch, head, token)
-        return quantize_symmetric(values, self.bits, dim=3)
 
     def get_kv(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Get full (dequantized + residual) KV states for a layer.
@@ -137,11 +109,9 @@ class KIVIQuantizedKVCache:
         parts_v = []
 
         # Dequantize the quantized portion
-        if entry["quantized_k"] is not None:
-            dk = dequantize_symmetric(entry["quantized_k"], entry["scale_k"])
-            dv = dequantize_symmetric(entry["quantized_v"], entry["scale_v"])
-            parts_k.append(dk)
-            parts_v.append(dv)
+        if entry["gq_k"] is not None:
+            parts_k.append(dequantize_grouped(entry["gq_k"]))
+            parts_v.append(dequantize_grouped(entry["gq_v"]))
 
         # Append residual (FP16) portion
         parts_k.append(entry["full_k"])
@@ -163,15 +133,13 @@ class KIVIQuantizedKVCache:
         """
         total = 0
         for entry in self._cache.values():
-            # Quantized portion: logical packed size
-            if entry["quantized_k"] is not None:
-                total += entry["quantized_k"].nelement() * self.bits // 8
-                total += entry["quantized_v"].nelement() * self.bits // 8
-                total += entry["scale_k"].nelement() * entry["scale_k"].element_size()
-                total += entry["scale_v"].nelement() * entry["scale_v"].element_size()
-            # FP16 residual: actual size
-            total += entry["full_k"].nelement() * entry["full_k"].element_size()
-            total += entry["full_v"].nelement() * entry["full_v"].element_size()
+            # Quantized portion: logical packed size (codes + fp16 scale/zp)
+            if entry["gq_k"] is not None:
+                total += entry["gq_k"].memory_bytes()
+                total += entry["gq_v"].memory_bytes()
+            # FP16 residual: 2 bytes/elem (logical FP16, matching other methods)
+            total += entry["full_k"].nelement() * 2
+            total += entry["full_v"].nelement() * 2
         return total
 
     def memory_summary(self) -> dict:
@@ -180,15 +148,13 @@ class KIVIQuantizedKVCache:
         residual_bytes = 0
 
         for entry in self._cache.values():
-            if entry["quantized_k"] is not None:
-                quantized_bytes += entry["quantized_k"].nelement() * self.bits // 8
-                quantized_bytes += entry["quantized_v"].nelement() * self.bits // 8
-                quantized_bytes += entry["scale_k"].nelement() * entry["scale_k"].element_size()
-                quantized_bytes += entry["scale_v"].nelement() * entry["scale_v"].element_size()
+            if entry["gq_k"] is not None:
+                quantized_bytes += entry["gq_k"].memory_bytes()
+                quantized_bytes += entry["gq_v"].memory_bytes()
             for k in ["full_k", "full_v"]:
                 t = entry[k]
                 if isinstance(t, torch.Tensor):
-                    residual_bytes += t.nelement() * t.element_size()
+                    residual_bytes += t.nelement() * 2  # logical FP16
 
         return {
             "quantized_mb": quantized_bytes / (1024 * 1024),

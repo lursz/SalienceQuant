@@ -3,7 +3,15 @@
 Implements simple symmetric and asymmetric uniform quantization at configurable
 bit-widths (2, 4, 8 bit). This is the simplest baseline — same quantization
 applied to all layers, tokens, and channels uniformly.
+
+Also provides group-wise asymmetric quantization (the standard technique used by
+KIVI/KVQuant): the scale/zero-point are computed over small contiguous groups
+along one axis rather than the whole axis. This is essential at low bit-widths —
+a single scale spanning thousands of tokens cannot cover a channel's dynamic
+range with only 4 (2-bit) levels.
 """
+
+from dataclasses import dataclass
 
 import torch
 
@@ -191,3 +199,127 @@ class UniformQuantizedKVCache:
                 total += s_v.nelement() * s_v.element_size()
                 total += z_v.nelement() * z_v.element_size()
         return total
+
+
+# ---------------------------------------------------------------------------
+# Group-wise quantization (KIVI / KVQuant style)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GroupedQuant:
+    """A group-wise quantized tensor plus the metadata needed to reverse it.
+
+    The quantized codes are stored in the *grouped* (and zero-padded) layout
+    ``[..., n_groups, group_size]`` along the moved axis. ``dequantize_grouped``
+    reshapes back, slices off padding, and moves the axis home.
+    """
+    codes: torch.Tensor          # quantized integers, grouped+padded layout
+    scale: torch.Tensor          # [..., n_groups, 1]
+    zero_point: torch.Tensor | None
+    axis: int
+    group_size: int
+    orig_len: int
+    bits: int
+
+    def memory_bytes(self) -> int:
+        """Logical packed size: codes at `bits`/elem (unpadded) + scale/zp at 2 B."""
+        n_groups, group_size = self.codes.shape[-2], self.codes.shape[-1]
+        padded_len = n_groups * group_size
+        # real (unpadded) element count = other dims * orig_len
+        n_elem = self.codes.numel() // padded_len * self.orig_len
+        total = n_elem * self.bits // 8
+        # scale + zero_point stored in fp16 (2 bytes) — the realistic serving choice
+        total += self.scale.numel() * 2
+        if self.zero_point is not None:
+            total += self.zero_point.numel() * 2
+        return total
+
+
+def quantize_grouped(
+    tensor: torch.Tensor,
+    bits: int,
+    axis: int,
+    group_size: int,
+    symmetric: bool = False,
+) -> GroupedQuant:
+    """Group-wise quantization along ``axis`` in contiguous groups of ``group_size``.
+
+    Each group gets its own scale (and zero-point, if asymmetric). The axis is
+    padded up to a multiple of ``group_size`` so any length is supported.
+
+    Args:
+        tensor: Input tensor.
+        bits: Bit-width (2, 4, 8).
+        axis: Dimension along which groups are formed and stats computed.
+            For KIVI Keys use the token axis (per-channel); for Values use the
+            head-dim axis (per-token).
+        group_size: Number of elements per group along ``axis``.
+        symmetric: Symmetric (no zero-point) vs asymmetric. Asymmetric is the
+            default — KV distributions are not zero-centred.
+
+    Returns:
+        A ``GroupedQuant`` holding codes + scale (+ zero_point).
+    """
+    x = tensor.movedim(axis, -1)
+    moved_shape = x.shape
+    orig_len = moved_shape[-1]
+    pad = (-orig_len) % group_size
+    if pad:
+        x = torch.nn.functional.pad(x, (0, pad))
+    g = x.reshape(*x.shape[:-1], -1, group_size)  # [..., n_groups, group_size]
+
+    if symmetric:
+        qmax = (1 << (bits - 1)) - 1
+        amax = g.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+        scale = amax / qmax
+        codes = (g / scale).round().clamp(-qmax - 1, qmax).to(torch.int8)
+        zero_point = None
+    else:
+        qmax = (1 << bits) - 1
+        vmin = g.amin(dim=-1, keepdim=True)
+        vmax = g.amax(dim=-1, keepdim=True)
+        scale = (vmax - vmin).clamp(min=1e-8) / qmax
+        zero_point = (-vmin / scale).round()
+        codes = (g / scale + zero_point).round().clamp(0, qmax).to(torch.int16)
+
+    return GroupedQuant(
+        codes=codes, scale=scale, zero_point=zero_point,
+        axis=axis, group_size=group_size, orig_len=orig_len, bits=bits,
+    )
+
+
+def dequantize_grouped(gq: GroupedQuant) -> torch.Tensor:
+    """Reverse :func:`quantize_grouped`, returning a tensor of the original shape."""
+    codes = gq.codes.float()
+    if gq.zero_point is None:
+        deq = codes * gq.scale
+    else:
+        deq = (codes - gq.zero_point) * gq.scale
+    # collapse groups -> moved-axis-last layout, drop padding, move axis home
+    deq = deq.reshape(*deq.shape[:-2], -1)[..., :gq.orig_len]
+    return deq.movedim(-1, gq.axis)
+
+
+def quantize_dequantize_grouped(
+    tensor: torch.Tensor,
+    bits: int,
+    axis: int,
+    group_size: int,
+    symmetric: bool = False,
+) -> torch.Tensor:
+    """Convenience round-trip used by simulation hooks."""
+    return dequantize_grouped(
+        quantize_grouped(tensor, bits, axis, group_size, symmetric)
+    ).to(tensor.dtype)
+
+
+def grouped_effective_bits(
+    bits: int, group_size: int, asymmetric: bool = True, meta_bits: int = 16
+) -> float:
+    """Effective bits/element including fp16 scale (+ zero-point) overhead.
+
+    A group of ``group_size`` elements shares one scale (and, if asymmetric, one
+    zero-point), each stored in ``meta_bits`` bits.
+    """
+    n_meta = 2 if asymmetric else 1
+    return bits + n_meta * meta_bits / group_size
