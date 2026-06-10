@@ -76,54 +76,51 @@ class TierConfig:
         ]
 
 
+def _rank_into_tiers(
+    importance: torch.Tensor,
+    protected_mask: torch.Tensor,
+    config: TierConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rank the non-protected tokens by importance and assign each a tier.
+
+    Shared by :func:`assign_tiers` and :func:`apply_tiered_quant` so the
+    ranking and tier-boundary maths live in exactly one place.
+
+    Returns:
+        ``(ranked, tier_of)``, two equal-length 1-D tensors in descending
+        importance order: ``ranked`` are token indices, ``tier_of`` the Tier
+        (as int) assigned to each. Cumulative `round()` boundaries avoid a
+        systematic bias toward the implicit INT2 remainder.
+    """
+    candidates = (~protected_mask).nonzero(as_tuple=True)[0]
+    n = candidates.numel()
+    ranked = candidates[importance[candidates].argsort(descending=True)]
+
+    tier_of = torch.full((n,), int(Tier.INT2), dtype=torch.long, device=importance.device)
+    cursor = 0
+    for frac, tier in config.tiers()[:-1]:  # INT2 is the implicit remainder
+        count = min(round(n * frac), n - cursor)
+        if count > 0:
+            tier_of[cursor:cursor + count] = int(tier)
+            cursor += count
+    return ranked, tier_of
+
+
 def assign_tiers(
     importance_scores: torch.Tensor,
     protected_mask: torch.Tensor,
     config: TierConfig = TierConfig(),
 ) -> torch.Tensor:
-    """Assign each token to a precision tier based on importance.
+    """Per-token tier labels: protected tokens FP16, the rest split by importance.
 
-    Args:
-        importance_scores: [seq_len] tensor of importance scores.
-        protected_mask: [seq_len] boolean tensor. True = always FP16.
-        config: Tier assignment percentages.
-
-    Returns:
-        [seq_len] tensor of Tier values (0=FP16, 1=INT8, 2=INT4, 3=INT2).
+    Returns a [seq_len] tensor of Tier values (0=FP16 … 4=INT2).
     """
-    seq_len = importance_scores.size(0)
-    tiers = torch.full((seq_len,), Tier.INT2, dtype=torch.long,
-                        device=importance_scores.device)
-
-    # Protected tokens are always FP16
-    tiers[protected_mask] = Tier.FP16
-
-    # For non-protected tokens, assign by importance rank
-    non_protected = ~protected_mask
-    non_protected_indices = non_protected.nonzero(as_tuple=True)[0]
-    n_non_protected = non_protected_indices.size(0)
-
-    if n_non_protected == 0:
-        return tiers
-
-    # Sort non-protected tokens by importance (descending)
-    non_protected_scores = importance_scores[non_protected_indices]
-    sorted_indices = non_protected_scores.argsort(descending=True)
-    sorted_non_protected = non_protected_indices[sorted_indices]
-
-    # Assign tiers by cumulative percentage in descending-importance order
-    # (use round to avoid systematic INT2 bias). The last tier (INT2) absorbs
-    # the remainder, so it is not pre-counted.
-    cursor = 0
-    for frac, tier in config.tiers()[:-1]:
-        n = round(n_non_protected * frac)
-        n = min(n, n_non_protected - cursor)
-        if n > 0:
-            tiers[sorted_non_protected[cursor:cursor + n]] = tier
-            cursor += n
-    if cursor < n_non_protected:
-        tiers[sorted_non_protected[cursor:]] = Tier.INT2
-
+    tiers = torch.full(
+        (importance_scores.size(0),), int(Tier.FP16),
+        dtype=torch.long, device=importance_scores.device,
+    )
+    ranked, tier_of = _rank_into_tiers(importance_scores, protected_mask, config)
+    tiers[ranked] = tier_of  # protected tokens are left at FP16
     return tiers
 
 
@@ -177,105 +174,76 @@ class TieredQuantizer:
         self._seq_len = keys.size(2)
         self._shape = (keys.size(0), keys.size(1), keys.size(3))
         self._device = keys.device
-        self._key_tiers.clear()
-        self._value_tiers.clear()
-        self._key_tier_indices.clear()
-        self._value_tier_indices.clear()
 
-        # Pre-compute Fisher scaling factors (SmoothQuant-style)
-        # Scale = sqrt(fisher + eps), applied before quantization and reversed after.
-        # This gives high-Fisher channels more of the quantization range.
-        if key_fisher_weights is not None:
-            self._key_fisher_scale = (key_fisher_weights + 1e-8).sqrt()  # [kv_heads, head_dim]
-        else:
-            self._key_fisher_scale = None
+        # Fisher scale (SmoothQuant-style): sqrt(fisher) applied before quantization
+        # and reversed after, giving high-Fisher channels more of the range.
+        self._key_fisher_scale = self._fisher_scale(key_fisher_weights)
+        self._value_fisher_scale = self._fisher_scale(value_fisher_weights)
 
-        if value_fisher_weights is not None:
-            self._value_fisher_scale = (value_fisher_weights + 1e-8).sqrt()
-        else:
-            self._value_fisher_scale = None
+        # Keys group along the token axis (per-channel); Values along head_dim (per-token).
+        self._key_tiers, self._key_tier_indices = self._store_side(
+            keys, key_tier_assignments, axis=2, fisher_scale=self._key_fisher_scale)
+        self._value_tiers, self._value_tier_indices = self._store_side(
+            values, value_tier_assignments, axis=3, fisher_scale=self._value_fisher_scale)
 
+    @staticmethod
+    def _fisher_scale(weights: torch.Tensor | None) -> torch.Tensor | None:
+        return None if weights is None else (weights + 1e-8).sqrt()
+
+    def _store_side(
+        self,
+        tensor: torch.Tensor,
+        tier_assignments: torch.Tensor,
+        axis: int,
+        fisher_scale: torch.Tensor | None,
+    ) -> tuple[dict, dict]:
+        """Split `tensor`'s tokens by tier and quantize each (FP16 kept raw)."""
+        tiers: dict[Tier, tuple] = {}
+        indices: dict[Tier, torch.Tensor] = {}
         for tier in Tier:
-            bits = TIER_BITS[tier]
-
-            # Keys
-            k_mask = key_tier_assignments == tier
-            k_indices = k_mask.nonzero(as_tuple=True)[0]
-            if k_indices.numel() > 0:
-                self._key_tier_indices[tier] = k_indices
-                k_tier = keys[:, :, k_indices, :]
-                if tier == Tier.FP16:
-                    self._key_tiers[tier] = (k_tier,)
-                else:
-                    if self._key_fisher_scale is not None:
-                        # Scale by sqrt(Fisher) before quantization
-                        scale = self._key_fisher_scale.unsqueeze(0).unsqueeze(2)  # [1, kv_heads, 1, head_dim]
-                        k_tier = k_tier * scale
-                    # Keys: per-channel — group along the token axis (dim=2)
-                    self._key_tiers[tier] = (
-                        quantize_grouped(k_tier, bits, axis=2, group_size=self.group_size),
-                    )
-
-            # Values
-            v_mask = value_tier_assignments == tier
-            v_indices = v_mask.nonzero(as_tuple=True)[0]
-            if v_indices.numel() > 0:
-                self._value_tier_indices[tier] = v_indices
-                v_tier = values[:, :, v_indices, :]
-                if tier == Tier.FP16:
-                    self._value_tiers[tier] = (v_tier,)
-                else:
-                    if self._value_fisher_scale is not None:
-                        scale = self._value_fisher_scale.unsqueeze(0).unsqueeze(2)
-                        v_tier = v_tier * scale
-                    # Values: per-token — group along the head_dim axis (dim=3)
-                    self._value_tiers[tier] = (
-                        quantize_grouped(v_tier, bits, axis=3, group_size=self.group_size),
-                    )
+            idx = (tier_assignments == tier).nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
+                continue
+            indices[tier] = idx
+            chunk = tensor[:, :, idx, :]
+            if tier == Tier.FP16:
+                tiers[tier] = (chunk,)
+            else:
+                if fisher_scale is not None:
+                    chunk = chunk * fisher_scale.unsqueeze(0).unsqueeze(2)  # [1, heads, 1, head_dim]
+                tiers[tier] = (quantize_grouped(
+                    chunk, TIER_BITS[tier], axis=axis, group_size=self.group_size),)
+        return tiers, indices
 
     def dequantize(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reconstruct full KV tensors by dequantizing all tiers.
-
-        Returns:
-            Tuple of (keys, values) with original shape and ordering.
-        """
+        """Reconstruct (keys, values) with the original shape and token ordering."""
         if not self._key_tier_indices and not self._value_tier_indices:
             raise ValueError("No data stored. Call quantize_and_store first.")
 
         batch, heads, head_dim = self._shape
-        device = self._device
         keys = torch.zeros(batch, heads, self._seq_len, head_dim,
-                          device=device, dtype=torch.float)
+                           device=self._device, dtype=torch.float)
         values = torch.zeros_like(keys)
-
-        for tier in Tier:
-            # Keys
-            if tier in self._key_tier_indices:
-                indices = self._key_tier_indices[tier]
-                if tier == Tier.FP16:
-                    k_deq = self._key_tiers[tier][0].float()
-                else:
-                    k_deq = dequantize_grouped(self._key_tiers[tier][0])
-                    # Reverse Fisher scaling
-                    if self._key_fisher_scale is not None:
-                        inv_scale = 1.0 / self._key_fisher_scale.unsqueeze(0).unsqueeze(2)
-                        k_deq = k_deq * inv_scale.to(k_deq.device)
-                keys[:, :, indices, :] = k_deq
-
-            # Values
-            if tier in self._value_tier_indices:
-                indices = self._value_tier_indices[tier]
-                if tier == Tier.FP16:
-                    v_deq = self._value_tiers[tier][0].float()
-                else:
-                    v_deq = dequantize_grouped(self._value_tiers[tier][0])
-                    # Reverse Fisher scaling
-                    if self._value_fisher_scale is not None:
-                        inv_scale = 1.0 / self._value_fisher_scale.unsqueeze(0).unsqueeze(2)
-                        v_deq = v_deq * inv_scale.to(v_deq.device)
-                values[:, :, indices, :] = v_deq
-
+        self._restore_side(keys, self._key_tiers, self._key_tier_indices, self._key_fisher_scale)
+        self._restore_side(values, self._value_tiers, self._value_tier_indices, self._value_fisher_scale)
         return keys, values
+
+    @staticmethod
+    def _restore_side(
+        out: torch.Tensor,
+        tiers: dict,
+        indices: dict,
+        fisher_scale: torch.Tensor | None,
+    ):
+        """Scatter each tier's dequantized tokens back into `out` (in place)."""
+        for tier, idx in indices.items():
+            if tier == Tier.FP16:
+                deq = tiers[tier][0].float()
+            else:
+                deq = dequantize_grouped(tiers[tier][0])
+                if fisher_scale is not None:  # reverse the sqrt(Fisher) pre-scaling
+                    deq = deq / fisher_scale.unsqueeze(0).unsqueeze(2).to(deq.device)
+            out[:, :, idx, :] = deq
 
     def memory_bytes(self) -> dict[str, int]:
         """Get memory usage breakdown by tier.
@@ -302,14 +270,6 @@ class TieredQuantizer:
             total += tier_bytes
         result["total"] = total
         return result
-
-    def tier_distribution(self) -> dict[str, int]:
-        """Get number of tokens in each tier (keys)."""
-        return {
-            tier.name: self._key_tier_indices[tier].numel()
-            for tier in Tier
-            if tier in self._key_tier_indices
-        }
 
 
 def apply_tiered_quant(
@@ -339,44 +299,27 @@ def apply_tiered_quant(
     Returns:
         Tensor with same shape, quantized per-tier.
     """
-    dtype = tensor.dtype
     seq_len = tensor.size(2)
     device = tensor.device
-    result = tensor.clone()
-
     importance = importance.to(device)
     if protected_mask is None:
         protected_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
     else:
         protected_mask = protected_mask.to(device)
 
-    # Rank only the non-protected tokens; protected ones stay FP16 (untouched).
-    candidates = (~protected_mask).nonzero(as_tuple=True)[0]
-    n = candidates.numel()
-    if n == 0:
-        return result
-    order = importance[candidates].argsort(descending=True)
-    ranked = candidates[order]
+    ranked, tier_of = _rank_into_tiers(importance, protected_mask, config)
+    result = tensor.clone()
 
-    def quant_tokens(idx, bits):
-        chunk = tensor[:, :, idx, :]
-        return quantize_dequantize_grouped(
-            chunk, bits=bits, axis=quant_dim, group_size=group_size, symmetric=False
-        ).to(dtype)
-
-    # Walk tiers in descending-importance order. FP16 tier is left untouched;
-    # INT2 (last) absorbs the remainder.
-    cursor = 0
-    for frac, tier in config.tiers():
-        if tier == Tier.INT2:
-            count = n - cursor
-        else:
-            count = min(round(n * frac), n - cursor)
-        if count <= 0:
+    # FP16 / protected tokens are left untouched; quantize each other tier in place.
+    for tier in Tier:
+        if tier == Tier.FP16:
             continue
-        idx = ranked[cursor:cursor + count]
-        if tier != Tier.FP16:
-            result[:, :, idx, :] = quant_tokens(idx, TIER_BITS[tier])
-        cursor += count
+        idx = ranked[tier_of == int(tier)]
+        if idx.numel() == 0:
+            continue
+        result[:, :, idx, :] = quantize_dequantize_grouped(
+            tensor[:, :, idx, :], bits=TIER_BITS[tier],
+            axis=quant_dim, group_size=group_size, symmetric=False,
+        ).to(tensor.dtype)
 
     return result

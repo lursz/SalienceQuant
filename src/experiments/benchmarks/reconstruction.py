@@ -165,8 +165,6 @@ def eval_salience(
         fisher_weights=fisher_weights,
     )
 
-    num_kv_groups = num_attention_heads // num_kv_heads
-
     # Feed all states into the cache
     for layer_idx in sorted(states.keys.keys()):
         k = states.keys[layer_idx]

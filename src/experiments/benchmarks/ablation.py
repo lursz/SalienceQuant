@@ -15,7 +15,7 @@ import torch
 from dataclasses import dataclass
 
 from src.shared.quantize import quantize_symmetric, dequantize_symmetric
-from src.salience.tiered import TierConfig, Tier, assign_tiers, TieredQuantizer
+from src.salience.tiered import TierConfig, assign_tiers, TieredQuantizer
 from src.salience.scoring.sink_detector import get_protected_mask
 from src.salience.scoring.attention_tracker import AttentionTracker
 from src.salience.scoring.importance import ImportanceScorer
@@ -92,7 +92,6 @@ def run_ablation(
     ref_vals_list = [states.values[i] for i in sorted(states.values.keys())]
     ref_k_cat = torch.cat(ref_keys_list, dim=2)
     ref_v_cat = torch.cat(ref_vals_list, dim=2)
-    fp16_bytes = ref_k_cat.nelement() * 2 + ref_v_cat.nelement() * 2
 
     # ---- Ablation 1: Uniform INT4 (no importance) ----
     approx_k_list, approx_v_list, total_mem = [], [], 0

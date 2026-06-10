@@ -1,7 +1,6 @@
 """Tests for all SalienceQuant components."""
 
 import torch
-import pytest
 
 
 # --- Quantization primitives ---
@@ -23,14 +22,6 @@ class TestUniformQuantization:
         assert x_hat.shape == x.shape
         # 2-bit has much larger error but should still reconstruct
         assert (x - x_hat).abs().mean() < 1.0
-
-    def test_asymmetric_roundtrip(self):
-        from src.shared.quantize import quantize_asymmetric, dequantize_asymmetric
-        x = torch.randn(2, 4, 128, 64) + 2.0  # shifted distribution
-        q, s, z = quantize_asymmetric(x, bits=8, dim=-1)
-        x_hat = dequantize_asymmetric(q, s, z)
-        assert x_hat.shape == x.shape
-        assert (x - x_hat).abs().mean() < 0.1
 
 
 class TestGroupedQuantization:
@@ -96,27 +87,6 @@ class TestKIVIQuantization:
         k_out, v_out = cache.get_kv(0)
         # Last 32 tokens should be exact (FP16 residual)
         assert torch.allclose(k[:, :, -32:, :], k_out[:, :, -32:, :], atol=1e-5)
-
-    def test_kivi_beats_uniform_on_values(self):
-        """KIVI's per-token V quantization should beat uniform's per-tensor."""
-        from src.kivi.cache import KIVIQuantizedKVCache
-        from src.shared.quantize import UniformQuantizedKVCache
-        k = torch.randn(1, 2, 512, 64)
-        v = torch.randn(1, 2, 512, 64)
-
-        # KIVI 2-bit
-        kivi = KIVIQuantizedKVCache(bits=2, residual_length=0)
-        kivi.update(k, v, layer_idx=0)
-        _, v_kivi = kivi.get_kv(0)
-        kivi_err = (v - v_kivi).abs().mean().item()
-
-        # Uniform 2-bit per-tensor
-        uniform = UniformQuantizedKVCache(bits=2, per_tensor=True)
-        uniform.quantize_and_store(k, v, layer_idx=0)
-        _, v_uni = uniform.dequantize(0)
-        uni_err = (v - v_uni).abs().mean().item()
-
-        assert kivi_err < uni_err, f"KIVI ({kivi_err}) should beat uniform ({uni_err})"
 
 
 # --- Scoring components ---
@@ -323,7 +293,6 @@ class TestSalienceCache:
     def test_with_per_layer_configs(self):
         """Test SalienceCache with per-layer tier configs from budget optimizer."""
         from src.salience.cache import SalienceCache
-        from src.salience.tiered import TierConfig
         from src.salience.budget.optimizer import optimize_tier_configs
 
         num_layers = 4

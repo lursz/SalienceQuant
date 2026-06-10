@@ -235,9 +235,7 @@ def _compute_window_importance(
     val_imp: dict[int, torch.Tensor] = {}
 
     for idx in range(num_layers):
-        attn = outputs.attentions[idx].float()        # [b, qh, S, S]
-        attn = attn.mean(dim=0)                         # [qh, S, S]
-        qh = attn.size(0)
+        attn = outputs.attentions[idx].float().mean(dim=0)   # [qh, S, S], avg over batch
 
         # received attention per (head, key token), normalised by attending queries
         received = attn.sum(dim=1) / valid_counts.unsqueeze(0)   # [qh, S]

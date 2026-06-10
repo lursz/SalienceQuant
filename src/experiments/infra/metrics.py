@@ -5,7 +5,7 @@ and memory efficiency metrics.
 """
 
 import torch
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass

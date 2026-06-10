@@ -1,7 +1,6 @@
 """Tests for Phase 4 experiment framework."""
 
 import torch
-import pytest
 
 
 class TestMetrics:

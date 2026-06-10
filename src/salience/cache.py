@@ -12,7 +12,7 @@ import torch
 from src.salience.scoring.importance import ImportanceScorer
 from src.salience.scoring.fisher import FisherChannelWeights
 from src.salience.scoring.sink_detector import get_protected_mask
-from src.salience.tiered import Tier, TieredQuantizer, TierConfig, assign_tiers
+from src.salience.tiered import TieredQuantizer, TierConfig, assign_tiers
 
 
 class SalienceCache:
@@ -76,7 +76,6 @@ class SalienceCache:
         self._full_keys: dict[int, torch.Tensor] = {}     # FP16 full storage
         self._full_values: dict[int, torch.Tensor] = {}
         self._quantizers: dict[int, TieredQuantizer] = {}  # Quantized storage
-        self._tier_assignments: dict[int, torch.Tensor] = {}
 
         self._step: int = 0
         self._is_quantized: dict[int, bool] = {}
@@ -211,7 +210,6 @@ class SalienceCache:
         tier_config = self._get_tier_config(layer_idx)
         key_tiers = assign_tiers(key_imp, protected, tier_config)
         val_tiers = assign_tiers(val_imp, protected, tier_config)
-        self._tier_assignments[layer_idx] = key_tiers  # store key tiers for diagnostics
 
         # Quantize with separate K/V tier maps and per-channel Fisher weights
         quantizer = TieredQuantizer()
@@ -255,39 +253,11 @@ class SalienceCache:
                 total += v.nelement() * v.element_size()
         return total
 
-    def memory_summary(self) -> dict:
-        """Detailed memory breakdown."""
-        total_quantized = 0
-        total_full = 0
-        tier_counts = {t.name: 0 for t in Tier}
-
-        for layer_idx in self._full_keys:
-            if self._is_quantized.get(layer_idx, False):
-                mem = self._quantizers[layer_idx].memory_bytes()
-                total_quantized += mem["total"]
-                if layer_idx in self._tier_assignments:
-                    dist = self._quantizers[layer_idx].tier_distribution()
-                    for name, count in dist.items():
-                        tier_counts[name] = tier_counts.get(name, 0) + count
-            else:
-                k = self._full_keys[layer_idx]
-                v = self._full_values[layer_idx]
-                total_full += k.nelement() * k.element_size()
-                total_full += v.nelement() * v.element_size()
-
-        return {
-            "quantized_mb": total_quantized / (1024 * 1024),
-            "full_precision_mb": total_full / (1024 * 1024),
-            "total_mb": (total_quantized + total_full) / (1024 * 1024),
-            "tier_token_counts": tier_counts,
-        }
-
     def clear(self):
         """Clear all cached data."""
         self._full_keys.clear()
         self._full_values.clear()
         self._quantizers.clear()
-        self._tier_assignments.clear()
         self._is_quantized.clear()
         self.scorer.reset()
         self._step = 0

@@ -63,36 +63,20 @@ def capture_states(
 
     hook_handles = []
 
-    # Register hooks on each attention layer
+    # Query states aren't returned by the model, so hook q_proj to capture them.
+    # (Attention weights and K/V come straight from the forward outputs below.)
+    def make_q_hook(idx):
+        def hook_fn(module, _input, output):  # output: [batch, seq, num_q_heads*head_dim]
+            batch_sz, seqlen, _ = output.shape
+            captured_q[idx] = output.view(
+                batch_sz, seqlen, num_q_heads, head_dim
+            ).transpose(1, 2).detach().cpu()
+        return hook_fn
+
     for layer_idx in range(num_layers):
-        layer = model.model.layers[layer_idx]
-
-        # Hook attention module to capture attention weights
-        def make_attn_hook(idx):
-            def hook_fn(module, args, kwargs, output):
-                if isinstance(output, tuple) and len(output) >= 2:
-                    attn_weights = output[1]
-                    if attn_weights is not None:
-                        captured_attn[idx] = attn_weights.detach().cpu()
-                return output
-            return hook_fn
-
-        h = layer.self_attn.register_forward_hook(
-            make_attn_hook(layer_idx), with_kwargs=True
+        h = model.model.layers[layer_idx].self_attn.q_proj.register_forward_hook(
+            make_q_hook(layer_idx)
         )
-        hook_handles.append(h)
-
-        # Hook q_proj to capture query states
-        def make_q_hook(idx):
-            def hook_fn(module, input, output):
-                # output: [batch, seq_len, num_q_heads * head_dim]
-                batch_sz, seqlen, _ = output.shape
-                captured_q[idx] = output.view(
-                    batch_sz, seqlen, num_q_heads, head_dim
-                ).transpose(1, 2).detach().cpu()
-            return hook_fn
-
-        h = layer.self_attn.q_proj.register_forward_hook(make_q_hook(layer_idx))
         hook_handles.append(h)
 
     try:

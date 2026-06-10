@@ -40,7 +40,8 @@ class KIVIQuantizedKVCache:
         self.residual_length = residual_length
         self.group_size = group_size
 
-        # Per layer: (quantized_k, scale_k, quantized_v, scale_v, residual_k, residual_v)
+        # layer_idx -> {"full_k", "full_v": FP16 residual tensors,
+        #               "gq_k", "gq_v": GroupedQuant of the older tokens (or None)}
         self._cache: dict[int, dict] = {}
 
     def update(
@@ -126,11 +127,7 @@ class KIVIQuantizedKVCache:
         self._cache.clear()
 
     def memory_bytes(self) -> int:
-        """Estimate total logical memory usage.
-
-        Quantized tensors report logical packed size (e.g. 2-bit = 0.25 bytes/elem).
-        Scale and FP16 residual tensors report actual size.
-        """
+        """Total logical memory: packed codes + fp16 scale/zp + fp16 residual."""
         total = 0
         for entry in self._cache.values():
             # Quantized portion: logical packed size (codes + fp16 scale/zp)
@@ -141,23 +138,3 @@ class KIVIQuantizedKVCache:
             total += entry["full_k"].nelement() * 2
             total += entry["full_v"].nelement() * 2
         return total
-
-    def memory_summary(self) -> dict:
-        """Get memory breakdown: quantized vs residual."""
-        quantized_bytes = 0
-        residual_bytes = 0
-
-        for entry in self._cache.values():
-            if entry["gq_k"] is not None:
-                quantized_bytes += entry["gq_k"].memory_bytes()
-                quantized_bytes += entry["gq_v"].memory_bytes()
-            for k in ["full_k", "full_v"]:
-                t = entry[k]
-                if isinstance(t, torch.Tensor):
-                    residual_bytes += t.nelement() * 2  # logical FP16
-
-        return {
-            "quantized_mb": quantized_bytes / (1024 * 1024),
-            "residual_mb": residual_bytes / (1024 * 1024),
-            "total_mb": (quantized_bytes + residual_bytes) / (1024 * 1024),
-        }

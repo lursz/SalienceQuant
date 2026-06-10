@@ -5,7 +5,6 @@ maintains cumulative importance scores with exponential moving average decay.
 """
 
 import torch
-from torch import nn
 
 
 class AttentionTracker:
@@ -114,16 +113,6 @@ class AttentionTracker:
             return scores.mean(dim=0)
         else:
             raise ValueError(f"Unknown aggregation: {aggregation}")
-
-    def get_per_head_importance(self, layer_idx: int) -> torch.Tensor:
-        """Get per-head, per-token importance scores.
-
-        Returns:
-            [num_kv_heads, seq_len] tensor.
-        """
-        if layer_idx not in self.scores:
-            raise ValueError(f"No scores tracked for layer {layer_idx}")
-        return self.scores[layer_idx]
 
     def reset(self):
         """Clear all tracked scores."""
