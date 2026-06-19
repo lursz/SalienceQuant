@@ -25,12 +25,7 @@ from src.shared.hooks import make_proj_quant_hook, make_residual_proj_hook, DEFA
 from src.shared.quantize import grouped_effective_bits
 from src.salience.tiered import TierConfig, apply_tiered_quant
 from src.salience.scoring.sink_detector import get_protected_mask
-from src.salience.enhanced import (
-    EnhancedQuantConfig,
-    apply_enhanced_key_quant,
-    apply_enhanced_value_quant,
-    compute_rate_quant_head_bits,
-)
+from src.salience.enhanced import TurboQuantConfig, apply_turboquant_key_quant
 
 
 def _get_kv_config(model: AutoModelForCausalLM) -> tuple[int, int]:
@@ -380,22 +375,23 @@ def evaluate_ppl_with_enhanced_salience_quant(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     tier_config: TierConfig | None = None,
-    eq_config: EnhancedQuantConfig | None = None,
+    tq_config: TurboQuantConfig | None = None,
     seq_len: int = 2048,
     max_samples: int = 5,
     device: str | None = None,
     num_sink_tokens: int = 4,
     recent_window: int = 16,
+    group_size: int = DEFAULT_GROUP_SIZE,
     input_ids: torch.Tensor | None = None,
 ) -> dict:
-    """SalienceQuant+ with KVarN, RateQuant, OTT, TurboQuant channels, MixKVQ."""
+    """SalienceQuant + TurboQuant outlier-channel protection on Keys."""
     if device is None or device == "auto":
         device = next(model.parameters()).device
     num_kv_heads, head_dim = _get_kv_config(model)
     num_q_heads = model.config.num_attention_heads
     num_kv_groups = num_q_heads // num_kv_heads
     config = tier_config or TierConfig()
-    eq_config = eq_config or EnhancedQuantConfig()
+    tq_config = tq_config or TurboQuantConfig(group_size=group_size)
 
     if input_ids is None:
         input_ids = load_wikitext2(tokenizer)
@@ -408,19 +404,13 @@ def evaluate_ppl_with_enhanced_salience_quant(
     key_imp: dict[int, torch.Tensor] = {}
     val_imp: dict[int, torch.Tensor] = {}
     protected: dict[str, torch.Tensor] = {}
-    queries: dict[int, torch.Tensor] = {}
-    received: dict[int, torch.Tensor] = {}
-    k_head_bits: dict[int, torch.Tensor] = {}
-    v_head_bits: dict[int, torch.Tensor] = {}
 
     def make_k_hook(idx):
         def hook(_m, _a, out):
             b, s, _ = out.shape
             x = out.view(b, s, num_kv_heads, head_dim).transpose(1, 2)
-            xq = apply_enhanced_key_quant(
-                x, key_imp[idx], config, protected["mask"], eq_config,
-                queries=queries.get(idx), received_attn=received.get(idx),
-                head_bits=k_head_bits.get(idx),
+            xq = apply_turboquant_key_quant(
+                x, key_imp[idx], config, protected["mask"], tq_config,
             )
             return xq.transpose(1, 2).contiguous().view(b, s, num_kv_heads * head_dim)
         return hook
@@ -429,10 +419,8 @@ def evaluate_ppl_with_enhanced_salience_quant(
         def hook(_m, _a, out):
             b, s, _ = out.shape
             x = out.view(b, s, num_kv_heads, head_dim).transpose(1, 2)
-            xq = apply_enhanced_value_quant(
-                x, val_imp[idx], config, protected["mask"], eq_config,
-                head_bits=v_head_bits.get(idx),
-            )
+            xq = apply_tiered_quant(x, val_imp[idx], config, quant_dim=-1,
+                                    protected_mask=protected["mask"], group_size=group_size)
             return xq.transpose(1, 2).contiguous().view(b, s, num_kv_heads * head_dim)
         return hook
 
@@ -451,41 +439,6 @@ def evaluate_ppl_with_enhanced_salience_quant(
         key_imp.clear(); key_imp.update(k_imp)
         val_imp.clear(); val_imp.update(v_imp)
         protected["mask"] = get_protected_mask(cur_len, num_sink_tokens, recent_window, device)
-
-        # Pass 1b: reuse importance pass attentions for RateQuant / MixKVQ
-        if eq_config.use_mixkvq or eq_config.use_rate_quant:
-            with torch.no_grad():
-                cap_q: dict[int, torch.Tensor] = {}
-                cap_attn: dict[int, torch.Tensor] = {}
-                handles_extra = []
-
-                def make_q_cap(i):
-                    def hook(_m, _a, o):
-                        b, s, _ = o.shape
-                        cap_q[i] = o.view(b, s, -1, head_dim).transpose(1, 2).mean(dim=0).detach()
-                    return hook
-
-                for idx, layer in enumerate(model.model.layers):
-                    handles_extra.append(layer.self_attn.q_proj.register_forward_hook(make_q_cap(idx)))
-                try:
-                    out_attn = model(chunk, output_attentions=True, use_cache=False)
-                finally:
-                    for h in handles_extra:
-                        h.remove()
-
-                valid = torch.arange(cur_len, 0, -1, device=device, dtype=torch.float)
-                for idx in range(model.config.num_hidden_layers):
-                    attn = out_attn.attentions[idx].float().mean(dim=0)
-                    received[idx] = attn.sum(dim=1) / valid.unsqueeze(0)
-                    if eq_config.use_rate_quant:
-                        kb, vb = compute_rate_quant_head_bits(
-                            attn, num_kv_heads, eq_config.target_avg_bits, eq_config,
-                        )
-                        k_head_bits[idx] = kb
-                        v_head_bits[idx] = vb
-                if eq_config.use_mixkvq:
-                    queries.clear()
-                    queries.update(cap_q)
 
         handles = []
         for idx, layer in enumerate(model.model.layers):
@@ -510,7 +463,7 @@ def evaluate_ppl_with_enhanced_salience_quant(
 
     avg_loss = total_loss / total_tokens
     protected_frac = min(num_sink_tokens + recent_window, seq_len) / seq_len
-    k_eff, v_eff = _salience_eff_bits(config, protected_frac, eq_config.group_size, head_dim)
+    k_eff, v_eff = _salience_eff_bits(config, protected_frac, group_size, head_dim)
     return {
         "perplexity": torch.exp(torch.tensor(avg_loss)).item(),
         "loss": avg_loss,
@@ -571,9 +524,9 @@ def run_ppl_comparison(
     r = evaluate_ppl_with_enhanced_salience_quant(
         model, tokenizer,
         tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.05, int3_pct=0.35),
-        eq_config=EnhancedQuantConfig(target_avg_bits=3.34, group_size=128),
+        tq_config=TurboQuantConfig(group_size=128),
         seq_len=seq_len, max_samples=max_samples, device=device,
-        recent_window=16, input_ids=input_ids)
+        group_size=128, recent_window=16, input_ids=input_ids)
     r["method"] = "SalienceQuant+ (~3.3b)"; add(r)
 
     # --- ~3.7 effective bits: KIVI can just fit 3-bit (near-lossless); we match it.
@@ -591,9 +544,9 @@ def run_ppl_comparison(
     r = evaluate_ppl_with_enhanced_salience_quant(
         model, tokenizer,
         tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.15, int3_pct=0.55),
-        eq_config=EnhancedQuantConfig(target_avg_bits=3.72, group_size=128),
+        tq_config=TurboQuantConfig(group_size=128),
         seq_len=seq_len, max_samples=max_samples, device=device,
-        recent_window=16, input_ids=input_ids)
+        group_size=128, recent_window=16, input_ids=input_ids)
     r["method"] = "SalienceQuant+ (~3.7b)"; add(r)
 
     # --- near-lossless reference ---
