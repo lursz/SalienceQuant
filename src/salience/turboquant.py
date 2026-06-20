@@ -1,4 +1,4 @@
-"""SalienceQuant + TurboQuant outlier-channel protection for Keys.
+"""TurboQuant outlier-channel protection for Keys.
 
 After tiered group-wise quantization, restores the top-RMS key channels
 (~10%) from the FP16 original. Values use standard tiered quant only.
@@ -37,6 +37,16 @@ def detect_outlier_channels(
     return rms >= threshold
 
 
+def apply_outlier_channel_overlay(
+    tensor: torch.Tensor,
+    source: torch.Tensor,
+    outlier_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Replace outlier channels in ``tensor`` with values from ``source``."""
+    mask = outlier_mask.unsqueeze(0).unsqueeze(2)  # [1, heads, 1, head_dim]
+    return torch.where(mask, source, tensor)
+
+
 def apply_turboquant_key_quant(
     keys: torch.Tensor,
     importance: torch.Tensor,
@@ -51,8 +61,4 @@ def apply_turboquant_key_quant(
         protected_mask=protected_mask, group_size=tq.group_size,
     )
     outlier_ch = detect_outlier_channels(keys, tq.channel_fraction)
-    for hi in range(keys.size(1)):
-        for ci in range(keys.size(3)):
-            if outlier_ch[hi, ci]:
-                result[:, hi, :, ci] = keys[:, hi, :, ci]
-    return result
+    return apply_outlier_channel_overlay(result, keys, outlier_ch)

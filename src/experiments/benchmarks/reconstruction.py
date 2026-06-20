@@ -18,6 +18,7 @@ from src.shared.quantize import quantize_symmetric, dequantize_symmetric
 from src.kivi.cache import KIVIQuantizedKVCache
 from src.salience.tiered import TierConfig
 from src.salience.cache import SalienceCache
+from src.salience.turboquant import TurboQuantConfig
 from src.experiments.infra.capture import CapturedStates
 from src.experiments.infra.metrics import (
     ReconstructionMetrics,
@@ -135,6 +136,7 @@ def eval_salience(
     use_v_deviation: bool = True,
     fisher_weights=None,
     per_layer_tier_configs=None,
+    turbo_config: TurboQuantConfig | None = None,
     name: str | None = None,
 ) -> MethodResult:
     """SalienceQuant: attention-aware multi-tier quantization.
@@ -149,6 +151,7 @@ def eval_salience(
             If False, use attention-only (for ablation).
         fisher_weights: Optional Fisher channel weights.
         per_layer_tier_configs: Optional per-layer tier configs.
+        turbo_config: If set, enable TurboQuant outlier-channel protection on Keys.
         name: Display name.
     """
     num_layers = states.num_layers
@@ -163,6 +166,7 @@ def eval_salience(
         tier_config=tier_config or TierConfig(),
         per_layer_tier_configs=per_layer_tier_configs or {},
         fisher_weights=fisher_weights,
+        turbo_config=turbo_config,
     )
 
     # Feed all states into the cache
@@ -255,6 +259,14 @@ def run_reconstruction_comparison(
         states, num_kv_heads, num_attention_heads,
         use_v_deviation=True,
         name="SalienceQuant (V-deviation)",
+    ))
+
+    # 5b. SalienceQuant+ — TurboQuant outlier channels on Keys
+    results.append(eval_salience(
+        states, num_kv_heads, num_attention_heads,
+        use_v_deviation=True,
+        turbo_config=TurboQuantConfig(),
+        name="SalienceQuant+ (TurboQuant)",
     ))
 
     # 6. SalienceQuant with Fisher weights (if provided)

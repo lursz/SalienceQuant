@@ -363,6 +363,67 @@ class TestSalienceCache:
         assert k_out.shape[2] == seq_len
 
 
+# --- TurboQuant ---
+
+class TestTurboQuant:
+    def test_detect_outlier_channels_fraction(self):
+        from src.salience.turboquant import detect_outlier_channels
+        keys = torch.randn(1, 2, 32, 64)
+        keys[:, :, :, 0] *= 10.0  # make channel 0 an outlier
+        mask = detect_outlier_channels(keys, outlier_fraction=0.10)
+        assert mask.shape == (2, 64)
+        assert mask.any()
+        assert mask[:, 0].all()
+
+    def test_outlier_overlay_restores_channels(self):
+        from src.salience.turboquant import apply_outlier_channel_overlay
+        source = torch.ones(1, 2, 4, 8)
+        result = torch.zeros(1, 2, 4, 8)
+        mask = torch.zeros(2, 8, dtype=torch.bool)
+        mask[:, 0] = True
+        out = apply_outlier_channel_overlay(result, source, mask)
+        assert out[:, :, :, 0].eq(1.0).all()
+        assert out[:, :, :, 1:].eq(0.0).all()
+
+    def test_turboquant_improves_key_mse_vs_tiered_only(self):
+        from src.salience.turboquant import apply_turboquant_key_quant, TurboQuantConfig
+        from src.salience.tiered import TierConfig, apply_tiered_quant
+        keys = torch.randn(1, 2, 128, 64)
+        keys[:, :, :, ::8] *= 8.0
+        importance = torch.rand(128)
+        protected = torch.zeros(128, dtype=torch.bool)
+        config = TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.0, int3_pct=1.0)
+
+        tiered = apply_tiered_quant(keys, importance, config, quant_dim=2, group_size=64)
+        turbo = apply_turboquant_key_quant(
+            keys, importance, config, protected, TurboQuantConfig(group_size=64),
+        )
+        assert (keys - turbo).pow(2).mean() <= (keys - tiered).pow(2).mean()
+
+    def test_salience_cache_with_turbo(self):
+        from src.salience.cache import SalienceCache
+        from src.salience.turboquant import TurboQuantConfig
+
+        cache = SalienceCache(
+            num_layers=2,
+            num_kv_heads=2,
+            num_attention_heads=4,
+            num_sink_tokens=2,
+            recent_window=8,
+            rescore_interval=1,
+            turbo_config=TurboQuantConfig(channel_fraction=0.10),
+        )
+        batch, kv_heads, q_heads, seq_len, head_dim = 1, 2, 4, 64, 32
+        for layer_idx in range(2):
+            k = torch.randn(batch, kv_heads, seq_len, head_dim)
+            k[:, :, :, 0] *= 10.0
+            v = torch.randn(batch, kv_heads, seq_len, head_dim)
+            attn = torch.softmax(torch.randn(batch, q_heads, 1, seq_len), dim=-1)
+            cache.update(layer_idx, k, v, attn)
+        k_out, _ = cache.get_kv(0)
+        assert k_out.shape[2] == seq_len
+
+
 # --- Budget optimizer ---
 
 class TestBudget:

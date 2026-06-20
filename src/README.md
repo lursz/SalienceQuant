@@ -51,3 +51,7 @@ Tier 3 (INT2):  Remaining (least important) tokens
 - Uses KIVI-style axis-aware quantization *within* each tier
 - Importance scoring differs for K vs V (gradient analysis shows they need different metrics)
 - Tier assignment is dynamic — tokens can be promoted/demoted during generation
+
+## TurboQuant (`turboquant.py`) — SalienceQuant+
+
+**Key channel protection.** After tiered quantization, restores the top ~10% of Key channels (by RMS magnitude) to FP16. Used by the perplexity benchmark as **SalienceQuant+** and optional in `SalienceCache` via `turbo_config`.
