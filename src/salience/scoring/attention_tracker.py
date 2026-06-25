@@ -5,7 +5,6 @@ maintains cumulative importance scores with exponential moving average decay.
 """
 
 import torch
-from torch import nn
 
 
 class AttentionTracker:
@@ -37,7 +36,6 @@ class AttentionTracker:
 
         # Per-layer, per-KV-head cumulative scores: [num_kv_heads, seq_len]
         self.scores: dict[int, torch.Tensor] = {}
-        self.step_count: int = 0
 
     def update(
         self,
@@ -83,6 +81,9 @@ class AttentionTracker:
                     device=prev.device, dtype=prev.dtype,
                 )
                 prev = torch.cat([prev, pad], dim=1)
+            elif kv_len < prev_len:
+                # Sequence shrunk (cache reset or reuse) — truncate
+                prev = prev[:, :kv_len]
 
             # EMA update
             self.scores[layer_idx] = (1 - self.alpha) * prev + self.alpha * attn
@@ -113,20 +114,6 @@ class AttentionTracker:
         else:
             raise ValueError(f"Unknown aggregation: {aggregation}")
 
-    def get_per_head_importance(self, layer_idx: int) -> torch.Tensor:
-        """Get per-head, per-token importance scores.
-
-        Returns:
-            [num_kv_heads, seq_len] tensor.
-        """
-        if layer_idx not in self.scores:
-            raise ValueError(f"No scores tracked for layer {layer_idx}")
-        return self.scores[layer_idx]
-
     def reset(self):
         """Clear all tracked scores."""
         self.scores.clear()
-        self.step_count = 0
-
-    def increment_step(self):
-        self.step_count += 1

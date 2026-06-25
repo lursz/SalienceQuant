@@ -1,27 +1,26 @@
 """Ablation study: isolate the contribution of each SalienceQuant component.
 
-Components ablated:
+Components ablated (in order):
     1. Base: Uniform INT4 (no importance awareness)
     2. +Attention scoring: use attention scores for tier assignment
-    3. +V-deviation: use Key Fisher metric (attention × V-deviation) for Keys
-    4. +Multi-tier: 4 tiers instead of 2 (FP16/INT4 → FP16/INT8/INT4/INT2)
-    5. +Attention sinks: protect first K tokens in FP16
-    6. +EMA decay: exponential decay on attention scores
+    3. +Multi-tier: 4 tiers instead of 2 (FP16/INT4 → FP16/INT8/INT4/INT2)
+    4. +Attention sinks: protect first K tokens in FP16
+    5. +EMA decay: exponential decay on attention scores
+    6. +V-deviation: use Key importance metric (attention × V-deviation) for Keys
     7. +Per-layer budget: different tier configs per layer based on sensitivity
     8. +Fisher channel weights: offline Fisher prior for channel importance
-    9. Full SalienceQuant: all components
 """
 
 import torch
 from dataclasses import dataclass
 
-from src.quantize.uniform import quantize_symmetric, dequantize_symmetric
-from src.quantize.tiered import TierConfig, Tier, assign_tiers, TieredQuantizer
-from src.scoring.sink_detector import get_protected_mask
-from src.scoring.attention_tracker import AttentionTracker
-from src.scoring.importance import ImportanceScorer
-from src.experiments.capture import CapturedStates
-from src.experiments.metrics import compute_reconstruction_metrics, ReconstructionMetrics
+from src.shared.quantize import quantize_symmetric, dequantize_symmetric
+from src.salience.tiered import TierConfig, assign_tiers, TieredQuantizer
+from src.salience.scoring.sink_detector import get_protected_mask
+from src.salience.scoring.attention_tracker import AttentionTracker
+from src.salience.scoring.importance import ImportanceScorer
+from src.experiments.infra.capture import CapturedStates
+from src.experiments.infra.metrics import compute_reconstruction_metrics, ReconstructionMetrics
 
 
 @dataclass
@@ -93,7 +92,6 @@ def run_ablation(
     ref_vals_list = [states.values[i] for i in sorted(states.values.keys())]
     ref_k_cat = torch.cat(ref_keys_list, dim=2)
     ref_v_cat = torch.cat(ref_vals_list, dim=2)
-    fp16_bytes = ref_k_cat.nelement() * 2 + ref_v_cat.nelement() * 2
 
     # ---- Ablation 1: Uniform INT4 (no importance) ----
     approx_k_list, approx_v_list, total_mem = [], [], 0

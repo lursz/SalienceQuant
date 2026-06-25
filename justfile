@@ -118,7 +118,7 @@ scaling-ppl seq_len=default_seq_len samples=default_samples:
 [doc('Evaluate baseline FP16 perplexity for a model')]
 baseline-ppl model=default_model:
     @echo "Baseline perplexity for {{model}}..."
-    uv run python -c "from src.models import load_model; from src.eval import evaluate_perplexity; m, t = load_model('{{model}}'); r = evaluate_perplexity(m, t, max_samples=5); print(f'PPL: {r[\"perplexity\"]:.2f}')"
+    uv run python -c "from src.shared.models import load_model; from src.shared.eval import evaluate_perplexity; m, t = load_model('{{model}}'); r = evaluate_perplexity(m, t, max_samples=5); print(f'PPL: {r[\"perplexity\"]:.2f}')"
 
 [group('util')]
 [doc('Show project structure')]

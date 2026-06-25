@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import torch
 
-from src.quantize.tiered import TierConfig, TIER_BITS, Tier
+from src.salience.tiered import TierConfig
 
 
 @dataclass
@@ -62,27 +62,35 @@ def compute_layer_bit_budget(
     # Scale to target average
     layer_bits = weights * target_avg_bits
 
-    # Clamp to valid range
-    layer_bits = layer_bits.clamp(min=min_bits, max=max_bits)
-
-    # Re-normalize to hit exact target
-    current_avg = layer_bits.mean().item()
-    if current_avg > 0:
-        layer_bits = layer_bits * (target_avg_bits / current_avg)
+    # Iterative water-filling: clamp and redistribute excess/deficit
+    # until the target average is achieved (or max iterations reached)
+    for _ in range(20):
         layer_bits = layer_bits.clamp(min=min_bits, max=max_bits)
+        current_avg = layer_bits.mean().item()
+        deficit = target_avg_bits - current_avg
+        if abs(deficit) < 0.01:
+            break
+        # Identify unclamped layers (not at min or max)
+        unclamped = (layer_bits > min_bits + 0.01) & (layer_bits < max_bits - 0.01)
+        n_unclamped = unclamped.sum().item()
+        if n_unclamped == 0:
+            break
+        # Distribute deficit evenly across unclamped layers
+        layer_bits[unclamped] += deficit * num_layers / n_unclamped
 
+    layer_bits = layer_bits.clamp(min=min_bits, max=max_bits)
     return {i: layer_bits[i].item() for i in range(num_layers)}
 
 
 def bits_to_tier_config(target_bits: float) -> TierConfig:
     """Convert a target average bit-width into tier percentages.
 
-    Solves for tier percentages such that:
+    Analytically solves for tier percentages such that:
         fp16_pct * 16 + int8_pct * 8 + int4_pct * 4 + int2_pct * 2 = target_bits
+        where int2_pct = 1 - fp16_pct - int8_pct - int4_pct
 
-    Uses a heuristic mapping:
-        - Higher target -> more tokens in FP16/INT8
-        - Lower target -> more tokens in INT2/INT4
+    Strategy: interpolate between adjacent tier anchor points.
+    Each anchor point is a 100% allocation to a single tier.
 
     Args:
         target_bits: Target average bits per element (2.0 to 16.0).
@@ -90,38 +98,27 @@ def bits_to_tier_config(target_bits: float) -> TierConfig:
     Returns:
         TierConfig with appropriate percentages.
     """
-    # Clamp to valid range
     target_bits = max(2.0, min(16.0, target_bits))
 
-    # Linear interpolation between extreme configs
-    # At 2 bits:  0% FP16, 0% INT8, 0% INT4, 100% INT2
-    # At 4 bits:  5% FP16, 10% INT8, 20% INT4, 65% INT2
-    # At 8 bits:  10% FP16, 30% INT8, 40% INT4, 20% INT2
-    # At 16 bits: 100% FP16, 0% INT8, 0% INT4, 0% INT2
-
     if target_bits <= 2.0:
+        # 100% INT2
         return TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.0)
     elif target_bits <= 4.0:
-        t = (target_bits - 2.0) / 2.0  # 0 to 1
-        return TierConfig(
-            fp16_pct=0.05 * t,
-            int8_pct=0.10 * t,
-            int4_pct=0.20 * t,
-        )
+        # Blend INT2 (2-bit) and INT4 (4-bit)
+        # t=0 -> all INT2, t=1 -> all INT4
+        t = (target_bits - 2.0) / 2.0
+        # Actual: t * 4 + (1-t) * 2 = 2 + 2t = target_bits ✓
+        return TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=t)
     elif target_bits <= 8.0:
-        t = (target_bits - 4.0) / 4.0  # 0 to 1
-        return TierConfig(
-            fp16_pct=0.05 + 0.05 * t,
-            int8_pct=0.10 + 0.20 * t,
-            int4_pct=0.20 + 0.20 * t,
-        )
+        # Blend INT4 (4-bit) and INT8 (8-bit)
+        t = (target_bits - 4.0) / 4.0
+        # Actual: t * 8 + (1-t) * 4 = 4 + 4t = target_bits ✓
+        return TierConfig(fp16_pct=0.0, int8_pct=t, int4_pct=1.0 - t)
     else:
-        t = (target_bits - 8.0) / 8.0  # 0 to 1
-        return TierConfig(
-            fp16_pct=0.10 + 0.90 * t,
-            int8_pct=max(0, 0.30 * (1 - t)),
-            int4_pct=max(0, 0.40 * (1 - t)),
-        )
+        # Blend INT8 (8-bit) and FP16 (16-bit)
+        t = (target_bits - 8.0) / 8.0
+        # Actual: t * 16 + (1-t) * 8 = 8 + 8t = target_bits ✓
+        return TierConfig(fp16_pct=t, int8_pct=1.0 - t, int4_pct=0.0)
 
 
 def optimize_tier_configs(
