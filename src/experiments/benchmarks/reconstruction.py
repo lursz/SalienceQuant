@@ -14,12 +14,12 @@ Methods compared:
 import torch
 from dataclasses import dataclass
 
-from src.quantize.uniform import quantize_symmetric, dequantize_symmetric
-from src.quantize.kivi import KIVIQuantizedKVCache
-from src.quantize.tiered import TierConfig
-from src.cache.salience_cache import SalienceCache
-from src.experiments.capture import CapturedStates
-from src.experiments.metrics import (
+from src.shared.quantize import quantize_symmetric, dequantize_symmetric
+from src.kivi.cache import KIVIQuantizedKVCache
+from src.salience.tiered import TierConfig
+from src.salience.cache import SalienceCache
+from src.experiments.infra.capture import CapturedStates
+from src.experiments.infra.metrics import (
     ReconstructionMetrics,
     compute_reconstruction_metrics,
 )
@@ -76,10 +76,10 @@ def eval_uniform(states: CapturedStates, bits: int = 4) -> MethodResult:
         all_ref_v.append(v)
         all_approx_v.append(v_hat)
 
-        # Memory: quantized values + scales
-        total_bytes += q_k.nelement() * q_k.element_size()
+        # Memory: logical packed size for quantized + actual size for scales
+        total_bytes += q_k.nelement() * bits // 8
         total_bytes += s_k.nelement() * s_k.element_size()
-        total_bytes += q_v.nelement() * q_v.element_size()
+        total_bytes += q_v.nelement() * bits // 8
         total_bytes += s_v.nelement() * s_v.element_size()
 
     ref_k = torch.cat(all_ref_k, dim=2)
@@ -158,14 +158,12 @@ def eval_salience(
         num_kv_heads=num_kv_heads,
         num_attention_heads=num_attention_heads,
         num_sink_tokens=4,
-        recent_window=min(128, states.seq_len // 4),
+        recent_window=128,
         rescore_interval=rescore_interval,
         tier_config=tier_config or TierConfig(),
         per_layer_tier_configs=per_layer_tier_configs or {},
         fisher_weights=fisher_weights,
     )
-
-    num_kv_groups = num_attention_heads // num_kv_heads
 
     # Feed all states into the cache
     for layer_idx in sorted(states.keys.keys()):

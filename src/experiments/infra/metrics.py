@@ -5,7 +5,7 @@ and memory efficiency metrics.
 """
 
 import torch
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -28,7 +28,7 @@ class ReconstructionMetrics:
 
     @property
     def avg_bits_per_element(self) -> float:
-        if self.fp16_memory_bytes == 0:
+        if self.fp16_memory_bytes == 0 or self.memory_bytes == 0:
             return 0.0
         return 16.0 / self.compression_ratio
 

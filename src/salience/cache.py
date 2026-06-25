@@ -9,10 +9,10 @@ Combines all components:
 
 import torch
 
-from src.scoring.importance import ImportanceScorer
-from src.scoring.fisher import FisherChannelWeights
-from src.scoring.sink_detector import get_protected_mask
-from src.quantize.tiered import Tier, TieredQuantizer, TierConfig, assign_tiers
+from src.salience.scoring.importance import ImportanceScorer
+from src.salience.scoring.fisher import FisherChannelWeights
+from src.salience.scoring.sink_detector import get_protected_mask
+from src.salience.tiered import TieredQuantizer, TierConfig, assign_tiers
 
 
 class SalienceCache:
@@ -76,17 +76,15 @@ class SalienceCache:
         self._full_keys: dict[int, torch.Tensor] = {}     # FP16 full storage
         self._full_values: dict[int, torch.Tensor] = {}
         self._quantizers: dict[int, TieredQuantizer] = {}  # Quantized storage
-        self._tier_assignments: dict[int, torch.Tensor] = {}
 
         self._step: int = 0
         self._is_quantized: dict[int, bool] = {}
+        self._seq_len: int = 0
 
     @property
     def seq_len(self) -> int:
-        """Current sequence length (from first layer)."""
-        for layer_idx in self._full_keys:
-            return self._full_keys[layer_idx].size(2)
-        return 0
+        """Current sequence length."""
+        return self._seq_len
 
     def update(
         self,
@@ -130,6 +128,9 @@ class SalienceCache:
             self._full_keys[layer_idx] = key_states
             self._full_values[layer_idx] = value_states
 
+        # Track actual sequence length
+        self._seq_len = self._full_keys[layer_idx].size(2)
+
         # Update attention-based scores (every step, cheap)
         self.scorer.update_attention(
             layer_idx, attention_weights, self.num_kv_groups
@@ -147,7 +148,6 @@ class SalienceCache:
         # After all layers updated, check if we should re-quantize
         if layer_idx == self.num_layers - 1:
             self._step += 1
-            self.scorer.attention_tracker.increment_step()
             if should_rescore:
                 self._requantize_all()
 
@@ -194,33 +194,30 @@ class SalienceCache:
         key_imp = key_imp[:seq_len]
         val_imp = val_imp[:seq_len]
 
-        # If Fisher weights available, scale importance by channel sensitivity
-        # We use the mean Fisher weight across channels as a layer-level scaling factor
+        # Get Fisher channel weights if available (passed to quantizer for per-channel scaling)
+        key_fisher_weights = None
+        val_fisher_weights = None
         if self.fisher_weights is not None:
-            key_channel_weights = self.fisher_weights.get_channel_weights(layer_idx, "key")
-            val_channel_weights = self.fisher_weights.get_channel_weights(layer_idx, "value")
-            # Mean Fisher across channels as a scalar layer-level weight
-            key_fisher_scale = key_channel_weights.mean().item()
-            val_fisher_scale = val_channel_weights.mean().item()
-            key_imp = key_imp * key_fisher_scale
-            val_imp = val_imp * val_fisher_scale
-
-        # Combined importance (max of key and value importance)
-        combined_imp = torch.max(key_imp, val_imp)
+            key_fisher_weights = self.fisher_weights.get_channel_weights(layer_idx, "key")
+            val_fisher_weights = self.fisher_weights.get_channel_weights(layer_idx, "value")
 
         # Protected mask
         protected = get_protected_mask(
             seq_len, self.num_sink_tokens, self.recent_window, device
         )
 
-        # Assign tiers using per-layer config
+        # Assign tiers separately for Keys and Values (asymmetric scoring)
         tier_config = self._get_tier_config(layer_idx)
-        tiers = assign_tiers(combined_imp, protected, tier_config)
-        self._tier_assignments[layer_idx] = tiers
+        key_tiers = assign_tiers(key_imp, protected, tier_config)
+        val_tiers = assign_tiers(val_imp, protected, tier_config)
 
-        # Quantize
+        # Quantize with separate K/V tier maps and per-channel Fisher weights
         quantizer = TieredQuantizer()
-        quantizer.quantize_and_store(keys, values, tiers)
+        quantizer.quantize_and_store(
+            keys, values, key_tiers, val_tiers,
+            key_fisher_weights=key_fisher_weights,
+            value_fisher_weights=val_fisher_weights,
+        )
         self._quantizers[layer_idx] = quantizer
         self._is_quantized[layer_idx] = True
 
@@ -256,39 +253,12 @@ class SalienceCache:
                 total += v.nelement() * v.element_size()
         return total
 
-    def memory_summary(self) -> dict:
-        """Detailed memory breakdown."""
-        total_quantized = 0
-        total_full = 0
-        tier_counts = {t.name: 0 for t in Tier}
-
-        for layer_idx in self._full_keys:
-            if self._is_quantized.get(layer_idx, False):
-                mem = self._quantizers[layer_idx].memory_bytes()
-                total_quantized += mem["total"]
-                if layer_idx in self._tier_assignments:
-                    dist = self._quantizers[layer_idx].tier_distribution()
-                    for name, count in dist.items():
-                        tier_counts[name] = tier_counts.get(name, 0) + count
-            else:
-                k = self._full_keys[layer_idx]
-                v = self._full_values[layer_idx]
-                total_full += k.nelement() * k.element_size()
-                total_full += v.nelement() * v.element_size()
-
-        return {
-            "quantized_mb": total_quantized / (1024 * 1024),
-            "full_precision_mb": total_full / (1024 * 1024),
-            "total_mb": (total_quantized + total_full) / (1024 * 1024),
-            "tier_token_counts": tier_counts,
-        }
-
     def clear(self):
         """Clear all cached data."""
         self._full_keys.clear()
         self._full_values.clear()
         self._quantizers.clear()
-        self._tier_assignments.clear()
         self._is_quantized.clear()
         self.scorer.reset()
         self._step = 0
+        self._seq_len = 0

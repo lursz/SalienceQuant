@@ -14,7 +14,27 @@ For Keys:
 """
 
 import torch
-from src.scoring.attention_tracker import AttentionTracker
+from src.salience.scoring.attention_tracker import AttentionTracker
+
+
+def _pool_last_query_to_kv(
+    x: torch.Tensor, num_kv_heads: int, num_kv_groups: int
+) -> torch.Tensor:
+    """Pool a per-query-head tensor down to per-KV-head at the last query position.
+
+    Args:
+        x: [batch, num_q_heads, query_len, dim] (dim is head_dim or kv_len).
+        num_kv_heads: Number of KV heads.
+        num_kv_groups: Q heads per KV head (GQA).
+
+    Returns:
+        [num_kv_heads, dim] — last query position, averaged over batch, with
+        Q-heads averaged within their KV-head group.
+    """
+    x = x.detach().float()[:, :, -1, :].mean(dim=0)  # [num_q_heads, dim]
+    if num_kv_groups > 1:
+        x = x.view(num_kv_heads, num_kv_groups, -1).mean(dim=1)
+    return x
 
 
 class ImportanceScorer:
@@ -83,54 +103,44 @@ class ImportanceScorer:
                 The attention-weighted sum (weights @ V) before output projection.
             num_kv_groups: Q heads per KV head (for GQA).
         """
-        # Compute V-deviation: ||V(t) - output|| for each token
-        # value_states: [batch, num_kv_heads, kv_len, head_dim]
-        # attention_output: [batch, num_q_heads, query_len, head_dim]
-
-        # Average output across batch and query_len -> [num_q_heads, head_dim]
-        output = attention_output.detach().float().mean(dim=(0, 2))
-
-        # If GQA, aggregate Q heads per KV head
-        if num_kv_groups > 1:
-            # [num_q_heads, head_dim] -> [num_kv_heads, num_kv_groups, head_dim] -> mean
-            output = output.view(self.num_kv_heads, num_kv_groups, -1).mean(dim=1)
-        # output: [num_kv_heads, head_dim]
-
-        # V deviation: [num_kv_heads, kv_len, head_dim]
-        V = value_states.detach().float().mean(dim=0)  # [num_kv_heads, kv_len, head_dim]
-        v_deviation = V - output.unsqueeze(1)  # broadcast over kv_len
-        v_deviation_norm = v_deviation.norm(dim=-1)  # [num_kv_heads, kv_len]
-
-        # Query norm: [num_q_heads, head_dim] -> [num_kv_heads]
-        Q = query_states.detach().float().mean(dim=(0, 2))  # [num_q_heads, head_dim]
-        if num_kv_groups > 1:
-            Q = Q.view(self.num_kv_heads, num_kv_groups, -1).mean(dim=1)
-        q_norm = Q.norm(dim=-1)  # [num_kv_heads]
+        # Everything is taken at the *last* query position (most informative for
+        # autoregressive generation) and pooled to per-KV-head:
+        #   output, Q : [num_kv_heads, head_dim]
+        #   attn      : [num_kv_heads, kv_len]
+        pool = lambda x: _pool_last_query_to_kv(x, self.num_kv_heads, num_kv_groups)
+        output = pool(attention_output)
+        Q = pool(query_states)
+        attn = pool(attention_weights)
         head_dim = Q.size(-1)
 
-        # Attention scores per KV head: [num_kv_heads, kv_len]
-        attn = attention_weights.detach().float().mean(dim=(0, 2))  # [num_q_heads, kv_len]
-        if num_kv_groups > 1:
-            attn = attn.view(self.num_kv_heads, num_kv_groups, -1).mean(dim=1)
+        # ||V(t) - output|| per token — how unusual token t's Value is vs. the
+        # current attention output (the term attention scores alone don't capture).
+        V = value_states.detach().float().mean(dim=0)        # [num_kv_heads, kv_len, head_dim]
+        v_deviation_norm = (V - output.unsqueeze(1)).norm(dim=-1)  # [num_kv_heads, kv_len]
+        q_norm = Q.norm(dim=-1)                               # [num_kv_heads]
 
         # Key importance: attention(t) * ||V(t) - output|| * ||Q|| / sqrt(d)
         key_imp = attn * v_deviation_norm * q_norm.unsqueeze(1) / (head_dim ** 0.5)
-        # key_imp: [num_kv_heads, kv_len]
 
-        # EMA update
-        kv_len = key_imp.size(1)
-        if layer_idx not in self.key_scores:
-            self.key_scores[layer_idx] = key_imp
-        else:
-            prev = self.key_scores[layer_idx]
-            prev_len = prev.size(1)
-            if kv_len > prev_len:
-                pad = torch.zeros(
-                    self.num_kv_heads, kv_len - prev_len,
-                    device=prev.device, dtype=prev.dtype,
-                )
-                prev = torch.cat([prev, pad], dim=1)
-            self.key_scores[layer_idx] = (1 - self.alpha) * prev + self.alpha * key_imp
+        self.key_scores[layer_idx] = self._ema(self.key_scores.get(layer_idx), key_imp)
+
+    def _ema(
+        self, prev: torch.Tensor | None, new: torch.Tensor
+    ) -> torch.Tensor:
+        """EMA-update a [num_kv_heads, kv_len] score, growing length as the cache does.
+
+        First observation (``prev is None``) is taken as-is. When new tokens have
+        appeared the previous scores are zero-padded before blending.
+        """
+        if prev is None:
+            return new
+        if new.size(1) > prev.size(1):
+            pad = torch.zeros(
+                self.num_kv_heads, new.size(1) - prev.size(1),
+                device=prev.device, dtype=prev.dtype,
+            )
+            prev = torch.cat([prev, pad], dim=1)
+        return (1 - self.alpha) * prev + self.alpha * new
 
     def get_value_importance(
         self, layer_idx: int, aggregation: str = "max"

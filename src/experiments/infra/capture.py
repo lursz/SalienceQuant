@@ -8,7 +8,7 @@ import torch
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.eval import load_wikitext2
+from src.shared.eval import load_wikitext2
 
 
 @dataclass
@@ -46,6 +46,9 @@ def capture_states(
         device = next(model.parameters()).device
 
     num_layers = model.config.num_hidden_layers
+    num_q_heads = model.config.num_attention_heads
+    num_kv_heads = getattr(model.config, "num_key_value_heads", num_q_heads)
+    head_dim = model.config.hidden_size // num_q_heads
 
     # Get calibration input
     input_ids = load_wikitext2(tokenizer, split="test")
@@ -60,40 +63,21 @@ def capture_states(
 
     hook_handles = []
 
-    # Register hooks on each attention layer
+    # Query states aren't returned by the model, so hook q_proj to capture them.
+    # (Attention weights and K/V come straight from the forward outputs below.)
+    def make_q_hook(idx):
+        def hook_fn(module, _input, output):  # output: [batch, seq, num_q_heads*head_dim]
+            batch_sz, seqlen, _ = output.shape
+            captured_q[idx] = output.view(
+                batch_sz, seqlen, num_q_heads, head_dim
+            ).transpose(1, 2).detach().cpu()
+        return hook_fn
+
     for layer_idx in range(num_layers):
-        layer = model.model.layers[layer_idx]
-
-        def make_hook(idx):
-            def hook_fn(module, args, kwargs, output):
-                # Capture attention weights from output tuple
-                if isinstance(output, tuple) and len(output) >= 2:
-                    attn_weights = output[1]
-                    if attn_weights is not None:
-                        captured_attn[idx] = attn_weights.detach().cpu()
-                return output
-            return hook_fn
-
-        h = layer.self_attn.register_forward_hook(
-            make_hook(layer_idx), with_kwargs=True
+        h = model.model.layers[layer_idx].self_attn.q_proj.register_forward_hook(
+            make_q_hook(layer_idx)
         )
         hook_handles.append(h)
-
-    # We also need KV states. Hook into the KV projection outputs.
-    for layer_idx in range(num_layers):
-        layer = model.model.layers[layer_idx]
-        attn = layer.self_attn
-
-        def make_kv_hook(idx, attn_module):
-            original_forward = attn_module.forward
-
-            def patched_forward(*a, **kw):
-                # Ensure attention weights are returned
-                kw["output_attentions"] = True
-                result = original_forward(*a, **kw)
-                return result
-
-            return patched_forward
 
     try:
         # Run forward pass with output_attentions=True
@@ -126,6 +110,20 @@ def capture_states(
             for layer_idx, attn_w in enumerate(outputs.attentions):
                 if attn_w is not None:
                     captured_attn[layer_idx] = attn_w.detach().cpu()
+
+        # Compute attention outputs from captured attention weights and values
+        # attn_output = attn_weights @ V_expanded  [batch, q_heads, seq, head_dim]
+        num_groups = num_q_heads // num_kv_heads
+        for layer_idx in range(num_layers):
+            if layer_idx in captured_attn and layer_idx in captured_values:
+                attn_w = captured_attn[layer_idx]  # [batch, q_heads, seq, seq]
+                v = captured_values[layer_idx]      # [batch, kv_heads, seq, head_dim]
+                # Expand V from kv_heads to q_heads for GQA
+                v_expanded = v.unsqueeze(2).expand(-1, -1, num_groups, -1, -1)
+                v_expanded = v_expanded.reshape(
+                    v.size(0), num_q_heads, v.size(2), head_dim
+                )
+                captured_output[layer_idx] = torch.matmul(attn_w, v_expanded)
 
     finally:
         for h in hook_handles:

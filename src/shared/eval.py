@@ -29,24 +29,22 @@ def evaluate_perplexity(
     tokenizer: AutoTokenizer,
     seq_len: int = 2048,
     stride: int | None = None,
-    dataset_name: str = "wikitext2",
     device: str | None = None,
     max_samples: int | None = None,
-    cache_impl: object | None = None,
+    input_ids: torch.Tensor | None = None,
+    output_attentions: bool = False,
 ) -> dict:
-    """Evaluate perplexity on a dataset.
-
-    Uses a sliding window approach with configurable stride.
+    """Evaluate perplexity on WikiText-2 using a sliding window.
 
     Args:
         model: The causal LM to evaluate.
         tokenizer: Tokenizer for the model.
         seq_len: Maximum sequence length per evaluation window.
         stride: Stride between windows. Defaults to seq_len // 2.
-        dataset_name: Dataset to evaluate on (currently only "wikitext2").
         device: Device to run on. None = infer from model.
         max_samples: Maximum number of windows to evaluate.
-        cache_impl: Optional custom KV cache implementation. If None, uses default.
+        input_ids: Pre-tokenized input. If None, loads WikiText-2.
+        output_attentions: Pass output_attentions=True to model forward.
 
     Returns:
         Dict with keys: "perplexity", "loss", "num_tokens", "seq_len".
@@ -54,15 +52,15 @@ def evaluate_perplexity(
     if stride is None:
         stride = seq_len // 2
 
-    if device is None:
+    if device is None or device == "auto":
         device = next(model.parameters()).device
 
-    if dataset_name == "wikitext2":
+    if input_ids is None:
         input_ids = load_wikitext2(tokenizer)
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
 
-    input_ids = input_ids.to(device)
+    if input_ids.device != torch.device(device):
+        input_ids = input_ids.to(device)
+
     total_len = input_ids.size(1)
 
     loss_fn = CrossEntropyLoss(reduction="none")
@@ -72,7 +70,8 @@ def evaluate_perplexity(
 
     progress = tqdm(
         range(0, total_len - seq_len, stride),
-        desc="Evaluating perplexity",
+        desc="Evaluating PPL",
+        leave=False,
     )
 
     for begin in progress:
@@ -82,12 +81,7 @@ def evaluate_perplexity(
         end = begin + seq_len
         chunk = input_ids[:, begin:end]
 
-        # Build kwargs for forward pass
-        kwargs = {}
-        if cache_impl is not None:
-            kwargs["past_key_values"] = cache_impl
-
-        outputs = model(chunk, **kwargs)
+        outputs = model(chunk, output_attentions=output_attentions)
         logits = outputs.logits
 
         # Shift logits and labels for next-token prediction
@@ -95,13 +89,7 @@ def evaluate_perplexity(
         shift_labels = chunk[:, 1:].contiguous()
 
         # Only count loss for tokens in the stride window (avoid double-counting)
-        if begin == 0:
-            # First window: count all tokens
-            target_start = 0
-        else:
-            # Subsequent windows: only count tokens in the stride portion
-            target_start = seq_len - stride
-
+        target_start = 0 if begin == 0 else seq_len - stride
         shift_logits = shift_logits[:, target_start:, :]
         shift_labels = shift_labels[:, target_start:]
 
@@ -115,7 +103,7 @@ def evaluate_perplexity(
         num_windows += 1
 
         current_ppl = torch.exp(torch.tensor(total_loss / total_tokens)).item()
-        progress.set_postfix(ppl=f"{current_ppl:.2f}", tokens=total_tokens)
+        progress.set_postfix(ppl=f"{current_ppl:.2f}")
 
     avg_loss = total_loss / total_tokens
     perplexity = torch.exp(torch.tensor(avg_loss)).item()
