@@ -5,6 +5,7 @@ Usage:
     uv run python -m src.experiments.runner --experiment ablation --synthetic
     uv run python -m src.experiments.runner --experiment perplexity --model 0.5b
     uv run python -m src.experiments.runner --experiment sweep --model 0.5b
+    uv run python -m src.experiments.runner --experiment sensitivity --model 0.5b
 """
 
 import argparse
@@ -140,6 +141,45 @@ def run_perplexity_experiment(args):
         _save_results(args.output, "perplexity", results)
 
 
+def run_sensitivity_experiment(args):
+    """Profile per-layer KV quantization sensitivity and optionally save JSON."""
+    print("=" * 70)
+    print("LAYER SENSITIVITY PROFILING")
+    print("=" * 70)
+
+    from src.shared.models import load_model
+    from src.salience.budget.sensitivity import profile_layer_sensitivity
+
+    print(f"Loading model: {args.model}...")
+    model, tokenizer = load_model(args.model, device=args.device)
+
+    start = time.perf_counter()
+    profile = profile_layer_sensitivity(
+        model, tokenizer,
+        bits=args.sensitivity_bits,
+        seq_len=args.seq_len,
+        max_samples=args.max_samples,
+        device=args.device,
+    )
+    elapsed = time.perf_counter() - start
+
+    sens = profile["layer_sensitivity_normalized"]
+    print(f"\nBaseline PPL: {profile['baseline_ppl']:.2f}")
+    print("Layer sensitivity (normalized):")
+    for idx in sorted(sens):
+        delta = profile["layer_sensitivity"][idx]
+        print(f"  layer {idx:2d}: {sens[idx]:.4f}  (ΔPPL={delta:+.2f})")
+    print(f"\nCompleted in {elapsed:.1f}s")
+
+    if args.output:
+        out_path = Path(args.output)
+        out_path.mkdir(parents=True, exist_ok=True)
+        filepath = out_path / "sensitivity.json"
+        with open(filepath, "w") as f:
+            json.dump({str(k): v for k, v in sens.items()}, f, indent=2)
+        print(f"Sensitivity profile saved to {filepath}")
+
+
 def run_sweep_experiment(args):
     """Run tier config sweep: vary FP16 percentage from aggressive to conservative."""
     print("=" * 70)
@@ -197,7 +237,7 @@ def main():
     parser = argparse.ArgumentParser(description="SalienceQuant Experiments")
     parser.add_argument(
         "--experiment", "-e",
-        choices=["reconstruction", "ablation", "perplexity", "sweep"],
+        choices=["reconstruction", "ablation", "perplexity", "sensitivity", "sweep"],
         required=True,
         help="Which experiment to run",
     )
@@ -218,6 +258,8 @@ def main():
     parser.add_argument("--no-budget", action="store_true", help="Skip per-layer budget in ablation")
     parser.add_argument("--sensitivity-path", type=str, default=None,
                         help="Path to JSON sensitivity profile for per-layer budget")
+    parser.add_argument("--sensitivity-bits", type=int, default=4,
+                        help="Bit-width used when profiling layer sensitivity")
 
     args = parser.parse_args()
 
@@ -225,6 +267,7 @@ def main():
         "reconstruction": run_reconstruction_experiment,
         "ablation": run_ablation_experiment,
         "perplexity": run_perplexity_experiment,
+        "sensitivity": run_sensitivity_experiment,
         "sweep": run_sweep_experiment,
     }
     experiments[args.experiment](args)

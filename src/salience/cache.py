@@ -4,6 +4,7 @@ Combines all components:
 - Importance scoring (attention-based for V, V-deviation for K)
 - Attention sink protection
 - Multi-tier mixed-precision quantization
+- TurboQuant outlier-channel FP16 restore on Keys
 - Dynamic re-scoring with promotion/demotion
 """
 
@@ -13,6 +14,7 @@ from src.salience.scoring.importance import ImportanceScorer
 from src.salience.scoring.fisher import FisherChannelWeights
 from src.salience.scoring.sink_detector import get_protected_mask
 from src.salience.tiered import TieredQuantizer, TierConfig, assign_tiers
+from src.salience.turboquant import TurboQuantConfig, detect_outlier_channels
 
 
 class SalienceCache:
@@ -44,6 +46,7 @@ class SalienceCache:
         tier_config: TierConfig | None = None,
         per_layer_tier_configs: dict[int, TierConfig] | None = None,
         fisher_weights: FisherChannelWeights | None = None,
+        turbo_config: TurboQuantConfig | None = None,
     ):
         """
         Args:
@@ -59,6 +62,8 @@ class SalienceCache:
                 Overrides tier_config for layers that have an entry.
             fisher_weights: Offline Fisher channel weights. If provided,
                 used to weight importance scores by channel sensitivity.
+            turbo_config: TurboQuant settings for the top-RMS key channels that
+                are restored to FP16 on dequantize. Defaults to TurboQuantConfig().
         """
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -69,6 +74,7 @@ class SalienceCache:
         self.tier_config = tier_config or TierConfig()
         self.per_layer_tier_configs = per_layer_tier_configs or {}
         self.fisher_weights = fisher_weights
+        self.turbo_config = turbo_config or TurboQuantConfig()
 
         self.scorer = ImportanceScorer(num_layers, num_kv_heads, alpha)
 
@@ -173,7 +179,7 @@ class SalienceCache:
         seq_len = keys.size(2)
 
         if seq_len <= self.num_sink_tokens + self.recent_window:
-            # Too short to quantize — keep everything in FP16
+            # Too short to quantize - keep everything in FP16
             self._is_quantized[layer_idx] = False
             return
 
@@ -211,12 +217,16 @@ class SalienceCache:
         key_tiers = assign_tiers(key_imp, protected, tier_config)
         val_tiers = assign_tiers(val_imp, protected, tier_config)
 
-        # Quantize with separate K/V tier maps and per-channel Fisher weights
-        quantizer = TieredQuantizer()
+        # TurboQuant: restore top-RMS key channels to FP16 on dequantize.
+        mask = detect_outlier_channels(keys, self.turbo_config.channel_fraction)
+        key_overlay = (mask, keys.clone())
+
+        quantizer = TieredQuantizer(group_size=self.turbo_config.group_size)
         quantizer.quantize_and_store(
             keys, values, key_tiers, val_tiers,
             key_fisher_weights=key_fisher_weights,
             value_fisher_weights=val_fisher_weights,
+            key_outlier_overlay=key_overlay,
         )
         self._quantizers[layer_idx] = quantizer
         self._is_quantized[layer_idx] = True

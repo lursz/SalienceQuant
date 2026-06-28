@@ -145,6 +145,8 @@ class TieredQuantizer:
         # Fisher scale factors for dequantization (SmoothQuant-style)
         self._key_fisher_scale: torch.Tensor | None = None
         self._value_fisher_scale: torch.Tensor | None = None
+        # TurboQuant: FP16 overlay for outlier key channels (mask, source keys)
+        self._key_outlier_overlay: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def quantize_and_store(
         self,
@@ -154,6 +156,7 @@ class TieredQuantizer:
         value_tier_assignments: torch.Tensor | None = None,
         key_fisher_weights: torch.Tensor | None = None,
         value_fisher_weights: torch.Tensor | None = None,
+        key_outlier_overlay: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         """Quantize and store KV states according to tier assignments.
 
@@ -167,6 +170,9 @@ class TieredQuantizer:
                 If provided, uses SmoothQuant-style scaling: channels with higher
                 Fisher get more of the quantization range, reducing their error.
             value_fisher_weights: [num_kv_heads, head_dim] Fisher weights for values.
+            key_outlier_overlay: Optional ``(outlier_mask, source_keys)`` for
+                TurboQuant channel restore on dequantize. ``outlier_mask`` is
+                ``[heads, head_dim]`` bool; ``source_keys`` is the pre-quant FP16 keys.
         """
         if value_tier_assignments is None:
             value_tier_assignments = key_tier_assignments
@@ -179,6 +185,7 @@ class TieredQuantizer:
         # and reversed after, giving high-Fisher channels more of the range.
         self._key_fisher_scale = self._fisher_scale(key_fisher_weights)
         self._value_fisher_scale = self._fisher_scale(value_fisher_weights)
+        self._key_outlier_overlay = key_outlier_overlay
 
         # Keys group along the token axis (per-channel); Values along head_dim (per-token).
         self._key_tiers, self._key_tier_indices = self._store_side(
@@ -226,6 +233,10 @@ class TieredQuantizer:
         values = torch.zeros_like(keys)
         self._restore_side(keys, self._key_tiers, self._key_tier_indices, self._key_fisher_scale)
         self._restore_side(values, self._value_tiers, self._value_tier_indices, self._value_fisher_scale)
+        if self._key_outlier_overlay is not None:
+            from src.salience.turboquant import apply_outlier_channel_overlay
+            mask, source = self._key_outlier_overlay
+            keys = apply_outlier_channel_overlay(keys, source.float(), mask)
         return keys, values
 
     @staticmethod

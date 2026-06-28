@@ -28,7 +28,7 @@ def _pool_last_query_to_kv(
         num_kv_groups: Q heads per KV head (GQA).
 
     Returns:
-        [num_kv_heads, dim] — last query position, averaged over batch, with
+        [num_kv_heads, dim] - last query position, averaged over batch, with
         Q-heads averaged within their KV-head group.
     """
     x = x.detach().float()[:, :, -1, :].mean(dim=0)  # [num_q_heads, dim]
@@ -113,7 +113,7 @@ class ImportanceScorer:
         attn = pool(attention_weights)
         head_dim = Q.size(-1)
 
-        # ||V(t) - output|| per token — how unusual token t's Value is vs. the
+        # ||V(t) - output|| per token - how unusual token t's Value is vs. the
         # current attention output (the term attention scores alone don't capture).
         V = value_states.detach().float().mean(dim=0)        # [num_kv_heads, kv_len, head_dim]
         v_deviation_norm = (V - output.unsqueeze(1)).norm(dim=-1)  # [num_kv_heads, kv_len]

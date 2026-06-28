@@ -20,7 +20,7 @@ class KIVIQuantizedKVCache:
 
     Keys use per-channel quantization (group-wise along the token axis).
     Values use per-token quantization (group-wise along the head_dim axis).
-    Both are group-wise asymmetric — a single scale spanning all tokens cannot
+    Both are group-wise asymmetric - a single scale spanning all tokens cannot
     represent a channel's range at low bit-widths. Recent tokens stay in FP16.
     """
 
@@ -89,8 +89,8 @@ class KIVIQuantizedKVCache:
         k_to_quant = entry["full_k"][:, :, :quant_len, :]
         v_to_quant = entry["full_v"][:, :, :quant_len, :]
 
-        # Keys: per-channel — group-wise along the token axis (dim=2).
-        # Values: per-token — group-wise along the head_dim axis (dim=3).
+        # Keys: per-channel - group-wise along the token axis (dim=2).
+        # Values: per-token - group-wise along the head_dim axis (dim=3).
         entry["gq_k"] = quantize_grouped(k_to_quant, self.bits, axis=2, group_size=self.group_size)
         entry["gq_v"] = quantize_grouped(v_to_quant, self.bits, axis=3, group_size=self.group_size)
 

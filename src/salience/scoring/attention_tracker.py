@@ -13,7 +13,7 @@ class AttentionTracker:
     Maintains an EMA-decayed cumulative score per token per KV head:
         score(t) <- (1 - alpha) * score(t) + alpha * attention(t)
 
-    Aggregates across attention heads using max (not mean) — if ANY head
+    Aggregates across attention heads using max (not mean) - if ANY head
     finds a token important, it should be protected.
     """
 
@@ -56,7 +56,7 @@ class AttentionTracker:
         # attention_weights: [batch, num_q_heads, query_len, kv_len]
         # Take mean over batch and query_len, keep per-head
         attn = attention_weights.detach().float()
-        # [num_q_heads, kv_len] — mean over batch and query dims
+        # [num_q_heads, kv_len] - mean over batch and query dims
         attn = attn.mean(dim=(0, 2))
 
         # If GQA: aggregate Q heads that share the same KV head (mean)
@@ -75,14 +75,14 @@ class AttentionTracker:
             prev_len = prev.size(1)
 
             if kv_len > prev_len:
-                # New tokens appeared — extend with zeros then update
+                # New tokens appeared - extend with zeros then update
                 pad = torch.zeros(
                     self.num_kv_heads, kv_len - prev_len,
                     device=prev.device, dtype=prev.dtype,
                 )
                 prev = torch.cat([prev, pad], dim=1)
             elif kv_len < prev_len:
-                # Sequence shrunk (cache reset or reuse) — truncate
+                # Sequence shrunk (cache reset or reuse) - truncate
                 prev = prev[:, :kv_len]
 
             # EMA update
@@ -96,8 +96,8 @@ class AttentionTracker:
         Args:
             layer_idx: Layer index.
             aggregation: How to aggregate across KV heads.
-                "max" — if any head finds token important, it's important (default).
-                "mean" — average importance across heads.
+                "max" - if any head finds token important, it's important (default).
+                "mean" - average importance across heads.
 
         Returns:
             [seq_len] tensor of importance scores.

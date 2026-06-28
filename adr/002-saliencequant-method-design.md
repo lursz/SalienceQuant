@@ -1,4 +1,4 @@
-# ADR-002: SalienceQuant — Method Design
+# ADR-002: SalienceQuant - Method Design
 
 ## Status
 Accepted

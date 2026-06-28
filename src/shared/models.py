@@ -18,7 +18,7 @@ def load_model(
     device: str = "auto",
     dtype: torch.dtype = torch.float16,
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
-    """Load a Qwen model and tokenizer.
+    """Load a ML model and tokenizer.
 
     Args:
         model_name_or_size: Either a size key ("0.5b", "1.5b", "3b", "7b")
