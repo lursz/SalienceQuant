@@ -7,9 +7,10 @@ All methods share one strong low-level quantizer: group-wise asymmetric
 quantization (KIVI/KVQuant style). On top of that:
     - Uniform  : same bits everywhere, per-token axis for both K and V.
     - KIVI     : per-channel K, per-token V, recent residual window in FP16.
-    - Salience : mixed precision — bits allocated per token by importance
+    - Salience : mixed precision - bits allocated per token by importance
                  (attention for V, attention x V-deviation for K), with sinks
-                 and a recent window protected in FP16.
+                 and a recent window protected in FP16, plus TurboQuant
+                 outlier-channel FP16 restore on Keys.
 
 To compare methods fairly we report *effective* bits/element, which includes
 the fp16 scale + zero-point overhead of group-wise quantization.
@@ -25,6 +26,7 @@ from src.shared.hooks import make_proj_quant_hook, make_residual_proj_hook, DEFA
 from src.shared.quantize import grouped_effective_bits
 from src.salience.tiered import TierConfig, apply_tiered_quant
 from src.salience.scoring.sink_detector import get_protected_mask
+from src.salience.turboquant import TurboQuantConfig, apply_turboquant_key_quant
 
 
 def _get_kv_config(model: AutoModelForCausalLM) -> tuple[int, int]:
@@ -47,7 +49,7 @@ def _kv_cache_mb(model: AutoModelForCausalLM, seq_len: int, k_avg_bits: float, v
 #
 # Keys are grouped along the (long) token axis, so the group really holds
 # `group_size` elements. Values are grouped along the head_dim axis, so the
-# group holds at most `head_dim` elements — meaning a large group_size gives
+# group holds at most `head_dim` elements - meaning a large group_size gives
 # values *more* scale/zp overhead than keys. We therefore account K and V
 # separately and report the mean.
 # --------------------------------------------------------------------------
@@ -195,7 +197,7 @@ def _compute_window_importance(
     Value importance  : attention mass received by each key token (H2O-style),
                         normalised by the number of queries that can attend to it.
     Key importance    : received_attention * ||V(t) - mean_output|| * ||Q|| / sqrt(d)
-                        — the V-deviation metric (the method's core contribution).
+                        - the V-deviation metric (the method's core contribution).
 
     Both are aggregated across heads with max (protect a token if *any* head
     needs it) and returned as [seq_len] tensors per layer.
@@ -258,11 +260,57 @@ def _compute_window_importance(
     return key_imp, val_imp
 
 
+def _reshape_kv_proj(out: torch.Tensor, num_kv_heads: int, head_dim: int) -> torch.Tensor:
+    """k_proj/v_proj output -> [batch, kv_heads, seq, head_dim]."""
+    b, s, _ = out.shape
+    return out.view(b, s, num_kv_heads, head_dim).transpose(1, 2)
+
+
+def _flatten_kv_proj(x: torch.Tensor, num_kv_heads: int, head_dim: int) -> torch.Tensor:
+    """[batch, kv_heads, seq, head_dim] -> k_proj/v_proj layout."""
+    b, _, s, _ = x.shape
+    return x.transpose(1, 2).contiguous().view(b, s, num_kv_heads * head_dim)
+
+
+def _make_salience_proj_hooks(
+    num_kv_heads: int,
+    head_dim: int,
+    key_imp: dict[int, torch.Tensor],
+    val_imp: dict[int, torch.Tensor],
+    protected: dict[str, torch.Tensor],
+    tier_config: TierConfig,
+    group_size: int,
+    turbo_config: TurboQuantConfig,
+):
+    """Build pass-2 hooks that quantize K/V projections by salience tiers."""
+    def make_k_hook(idx):
+        def hook(_m, _a, out):
+            x = _reshape_kv_proj(out, num_kv_heads, head_dim)
+            xq = apply_turboquant_key_quant(
+                x, key_imp[idx], tier_config, protected["mask"], turbo_config,
+            )
+            return _flatten_kv_proj(xq, num_kv_heads, head_dim)
+        return hook
+
+    def make_v_hook(idx):
+        def hook(_m, _a, out):
+            x = _reshape_kv_proj(out, num_kv_heads, head_dim)
+            xq = apply_tiered_quant(
+                x, val_imp[idx], tier_config, quant_dim=-1,
+                protected_mask=protected["mask"], group_size=group_size,
+            )
+            return _flatten_kv_proj(xq, num_kv_heads, head_dim)
+        return hook
+
+    return make_k_hook, make_v_hook
+
+
 @torch.no_grad()
 def evaluate_ppl_with_salience_quant(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     tier_config: TierConfig | None = None,
+    turbo_config: TurboQuantConfig | None = None,
     seq_len: int = 2048,
     max_samples: int = 5,
     device: str | None = None,
@@ -270,13 +318,15 @@ def evaluate_ppl_with_salience_quant(
     recent_window: int = 32,
     group_size: int = DEFAULT_GROUP_SIZE,
     input_ids: torch.Tensor | None = None,
+    method_name: str | None = None,
 ) -> dict:
     """SalienceQuant mixed-precision KV cache PPL evaluation (two passes/window).
 
     Pass 1 (FP16): derive per-token importance from the window's own attention.
     Pass 2: quantize each token to its tier (group-wise asymmetric) and score loss.
-    Using the window's own attention to decide importance mirrors SnapKV/H2O and
-    is a faithful proxy for what an online cache would accumulate.
+
+    Keys additionally get TurboQuant outlier-channel FP16 restore; ``turbo_config``
+    defaults to TurboQuantConfig().
     """
     if device is None or device == "auto":
         device = next(model.parameters()).device
@@ -284,6 +334,9 @@ def evaluate_ppl_with_salience_quant(
     num_q_heads = model.config.num_attention_heads
     num_kv_groups = num_q_heads // num_kv_heads
     config = tier_config or TierConfig()
+    turbo_config = turbo_config or TurboQuantConfig(group_size=group_size)
+    quant_group_size = turbo_config.group_size
+    label = method_name or "SalienceQuant"
 
     if input_ids is None:
         input_ids = load_wikitext2(tokenizer)
@@ -293,31 +346,16 @@ def evaluate_ppl_with_salience_quant(
     total_len = input_ids.size(1)
     loss_fn = CrossEntropyLoss(reduction="none")
 
-    # mutable per-layer importance + protected mask, read by the pass-2 hooks
     key_imp: dict[int, torch.Tensor] = {}
     val_imp: dict[int, torch.Tensor] = {}
     protected: dict[str, torch.Tensor] = {}
-
-    def make_k_hook(idx):
-        def hook(_m, _a, out):
-            b, s, _ = out.shape
-            x = out.view(b, s, num_kv_heads, head_dim).transpose(1, 2)
-            xq = apply_tiered_quant(x, key_imp[idx], config, quant_dim=2,
-                                    protected_mask=protected["mask"], group_size=group_size)
-            return xq.transpose(1, 2).contiguous().view(b, s, num_kv_heads * head_dim)
-        return hook
-
-    def make_v_hook(idx):
-        def hook(_m, _a, out):
-            b, s, _ = out.shape
-            x = out.view(b, s, num_kv_heads, head_dim).transpose(1, 2)
-            xq = apply_tiered_quant(x, val_imp[idx], config, quant_dim=-1,
-                                    protected_mask=protected["mask"], group_size=group_size)
-            return xq.transpose(1, 2).contiguous().view(b, s, num_kv_heads * head_dim)
-        return hook
+    make_k_hook, make_v_hook = _make_salience_proj_hooks(
+        num_kv_heads, head_dim, key_imp, val_imp, protected,
+        config, quant_group_size, turbo_config,
+    )
 
     total_loss, total_tokens, num_windows = 0.0, 0, 0
-    progress = tqdm(range(0, total_len - seq_len, stride), desc="SalienceQuant PPL", leave=False)
+    progress = tqdm(range(0, total_len - seq_len, stride), desc=f"{label} PPL", leave=False)
 
     for begin in progress:
         if num_windows >= max_samples:
@@ -325,15 +363,13 @@ def evaluate_ppl_with_salience_quant(
         chunk = input_ids[:, begin:begin + seq_len]
         cur_len = chunk.size(1)
 
-        # Pass 1: importance from the unquantized window
         k_imp, v_imp = _compute_window_importance(
-            model, chunk, num_kv_heads, head_dim, num_kv_groups
+            model, chunk, num_kv_heads, head_dim, num_kv_groups,
         )
         key_imp.clear(); key_imp.update(k_imp)
         val_imp.clear(); val_imp.update(v_imp)
         protected["mask"] = get_protected_mask(cur_len, num_sink_tokens, recent_window, device)
 
-        # Pass 2: quantized forward
         handles = []
         for idx, layer in enumerate(model.model.layers):
             handles.append(layer.self_attn.k_proj.register_forward_hook(make_k_hook(idx)))
@@ -357,13 +393,13 @@ def evaluate_ppl_with_salience_quant(
 
     avg_loss = total_loss / total_tokens
     protected_frac = min(num_sink_tokens + recent_window, seq_len) / seq_len
-    k_eff, v_eff = _salience_eff_bits(config, protected_frac, group_size, head_dim)
+    k_eff, v_eff = _salience_eff_bits(config, protected_frac, quant_group_size, head_dim)
     return {
         "perplexity": torch.exp(torch.tensor(avg_loss)).item(),
         "loss": avg_loss,
         "num_tokens": total_tokens,
         "seq_len": seq_len,
-        "method": "SalienceQuant",
+        "method": label,
         "avg_bits": (k_eff + v_eff) / 2,
         "kv_mb": _kv_cache_mb(model, seq_len, k_avg_bits=k_eff, v_avg_bits=v_eff),
     }
@@ -409,10 +445,14 @@ def run_ppl_comparison(
                                      device=device, residual_length=32, group_size=64))
     print("SalienceQuant (~3.3b)...")
     r = evaluate_ppl_with_salience_quant(
-        model, tokenizer, tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.05, int3_pct=0.35),
+        model, tokenizer,
+        tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.05, int3_pct=0.35),
+        turbo_config=TurboQuantConfig(group_size=128),
         seq_len=seq_len, max_samples=max_samples, device=device,
-        group_size=128, recent_window=16, input_ids=input_ids)
-    r["method"] = "SalienceQuant (~3.3b)"; add(r)
+        group_size=128, recent_window=16, input_ids=input_ids,
+        method_name="SalienceQuant (~3.3b)",
+    )
+    add(r)
 
     # --- ~3.7 effective bits: KIVI can just fit 3-bit (near-lossless); we match it.
     print("KIVI 3-bit (~3.7b)...")
@@ -420,10 +460,14 @@ def run_ppl_comparison(
                                      device=device, residual_length=16, group_size=128))
     print("SalienceQuant (~3.7b)...")
     r = evaluate_ppl_with_salience_quant(
-        model, tokenizer, tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.15, int3_pct=0.55),
+        model, tokenizer,
+        tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.15, int3_pct=0.55),
+        turbo_config=TurboQuantConfig(group_size=128),
         seq_len=seq_len, max_samples=max_samples, device=device,
-        group_size=128, recent_window=16, input_ids=input_ids)
-    r["method"] = "SalienceQuant (~3.7b)"; add(r)
+        group_size=128, recent_window=16, input_ids=input_ids,
+        method_name="SalienceQuant (~3.7b)",
+    )
+    add(r)
 
     # --- near-lossless reference ---
     print("KIVI 4-bit (lossless ref)...")

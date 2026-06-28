@@ -6,7 +6,7 @@ Two families:
   a chosen axis. Simple; used by the uniform reconstruction baseline.
 * **Group-wise asymmetric** (`quantize_grouped`): the KIVI/KVQuant workhorse. The
   scale *and* zero-point are computed over small contiguous groups along one axis
-  rather than the whole axis. This is what makes low bit-widths usable — a single
+  rather than the whole axis. This is what makes low bit-widths usable - a single
   scale spanning thousands of tokens cannot cover a channel's dynamic range with
   only 4 (2-bit) levels.
 """
@@ -72,7 +72,7 @@ class GroupedQuant:
         n_groups, group_size = self.codes.shape[-2], self.codes.shape[-1]
         n_real = self.codes.numel() // (n_groups * group_size) * self.orig_len
         total = n_real * self.bits // 8
-        total += self.scale.numel() * 2          # fp16 scale — realistic serving choice
+        total += self.scale.numel() * 2          # fp16 scale - realistic serving choice
         if self.zero_point is not None:
             total += self.zero_point.numel() * 2  # fp16 zero-point
         return total

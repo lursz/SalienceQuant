@@ -122,7 +122,7 @@ class TestReconstruction:
         )
         results = run_reconstruction_comparison(states, num_kv_heads=2, num_attention_heads=4)
 
-        assert len(results) >= 7  # FP16 + 2 uniform + 2 KIVI + 2 salience
+        assert len(results) >= 7  # FP16 + 2 uniform + 2 KIVI + attn-only + SalienceQuant
         # FP16 baseline should have perfect reconstruction
         assert results[0].metrics.key_mse == 0.0
 
