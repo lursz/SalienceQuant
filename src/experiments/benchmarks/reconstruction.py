@@ -7,8 +7,8 @@ Methods compared:
     1. FP16 baseline (no quantization)
     2. Uniform INT8/INT4 (naive baseline)
     3. KIVI 2-bit (per-channel K / per-token V)
-    4. SalienceQuant (attention-aware multi-tier)
-    5. SalienceQuant variants for ablation
+    4. SalienceQuant (attention-aware multi-tier + TurboQuant key channels)
+    5. SalienceQuant ablations
 """
 
 import torch
@@ -35,7 +35,7 @@ class MethodResult:
 
 
 def eval_fp16_baseline(states: CapturedStates) -> MethodResult:
-    """FP16 baseline — perfect reconstruction, full memory."""
+    """FP16 baseline - perfect reconstruction, full memory."""
     total_bytes = 0
     for layer_idx in states.keys:
         k = states.keys[layer_idx]
@@ -151,7 +151,8 @@ def eval_salience(
             If False, use attention-only (for ablation).
         fisher_weights: Optional Fisher channel weights.
         per_layer_tier_configs: Optional per-layer tier configs.
-        turbo_config: If set, enable TurboQuant outlier-channel protection on Keys.
+        turbo_config: TurboQuant outlier-channel settings for Keys. None uses the
+            SalienceCache default (TurboQuantConfig()).
         name: Display name.
     """
     num_layers = states.num_layers
@@ -247,26 +248,18 @@ def run_reconstruction_comparison(
     results.append(eval_kivi(states, bits=4, residual_length=128))
     results.append(eval_kivi(states, bits=2, residual_length=128))
 
-    # 4. SalienceQuant — attention only (ablation: no V-deviation)
+    # 4. SalienceQuant - attention only (ablation: no V-deviation)
     results.append(eval_salience(
         states, num_kv_heads, num_attention_heads,
         use_v_deviation=False,
         name="SalienceQuant (attn-only)",
     ))
 
-    # 5. SalienceQuant — full (with V-deviation)
+    # 5. SalienceQuant - full (V-deviation + TurboQuant key channels)
     results.append(eval_salience(
         states, num_kv_heads, num_attention_heads,
         use_v_deviation=True,
-        name="SalienceQuant (V-deviation)",
-    ))
-
-    # 5b. SalienceQuant+ — TurboQuant outlier channels on Keys
-    results.append(eval_salience(
-        states, num_kv_heads, num_attention_heads,
-        use_v_deviation=True,
-        turbo_config=TurboQuantConfig(),
-        name="SalienceQuant+ (TurboQuant)",
+        name="SalienceQuant",
     ))
 
     # 6. SalienceQuant with Fisher weights (if provided)

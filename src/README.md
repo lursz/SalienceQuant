@@ -10,7 +10,7 @@ Asymmetric:  q = round((x - min) / scale),  scale = (max - min) / (2^b - 1)
 ```
 
 - **Granularity:** per-tensor or per-token (configurable)
-- **No special handling** for Keys vs Values — treats them identically
+- **No special handling** for Keys vs Values - treats them identically
 - **Use case:** Lower bound for comparison. Any smart method should beat this.
 
 ## KIVI Quantization (`kivi.py`)
@@ -36,9 +36,9 @@ Values: per-TOKEN quantization (scale computed across head_dim dim)
 
 **Limitations:** Fixed bit-width for all layers and all tokens. No importance-aware allocation.
 
-## Tiered Quantization (`tiered.py`) — SalienceQuant
+## SalienceQuant (`tiered.py` + `turboquant.py`)
 
-**Core method.** Mixed-precision quantization where each token gets a different bit-width based on importance.
+**Core method.** Mixed-precision quantization where each token gets a different bit-width based on importance, with outlier Key channels restored to FP16.
 
 ```
 Tier 0 (FP16):  Attention sinks + recent window + top-P% important tokens
@@ -50,8 +50,5 @@ Tier 3 (INT2):  Remaining (least important) tokens
 **Key innovations:**
 - Uses KIVI-style axis-aware quantization *within* each tier
 - Importance scoring differs for K vs V (gradient analysis shows they need different metrics)
-- Tier assignment is dynamic — tokens can be promoted/demoted during generation
-
-## TurboQuant (`turboquant.py`) — SalienceQuant+
-
-**Key channel protection.** After tiered quantization, restores the top ~10% of Key channels (by RMS magnitude) to FP16. Used by the perplexity benchmark as **SalienceQuant+** and optional in `SalienceCache` via `turbo_config`.
+- Tier assignment is dynamic - tokens can be promoted/demoted during generation
+- **TurboQuant channel protection** (`turboquant.py`): after tiered quantization, the top ~10% of Key channels (by RMS magnitude) are restored to FP16. This is always on; tune it via `TurboQuantConfig` (`channel_fraction`, `group_size`) passed as `turbo_config` to `SalienceCache`.

@@ -1,4 +1,4 @@
-# SalienceQuant — KV Cache Quantization Experiments
+# SalienceQuant - KV Cache Quantization Experiments
 
 default:
     @just --list
@@ -36,7 +36,7 @@ test-coverage:
     @echo "Running tests with coverage..."
     uv run pytest tests/ -v --cov=src --cov-report=term-missing
 
-# ---------- Experiments (synthetic — no model/GPU needed) ----------
+# ---------- Experiments (synthetic - no model/GPU needed) ----------
 
 [group('synthetic')]
 [doc('Reconstruction quality comparison on synthetic data')]
@@ -61,7 +61,7 @@ sweep-synthetic seq_len=default_seq_len:
 all-synthetic seq_len=default_seq_len: (recon-synthetic seq_len) (ablation-synthetic seq_len) (sweep-synthetic seq_len)
     @echo "All synthetic experiments complete."
 
-# ---------- Experiments (real model — GPU recommended) ----------
+# ---------- Experiments (real model - GPU recommended) ----------
 
 [group('model')]
 [doc('Reconstruction quality comparison with real model')]

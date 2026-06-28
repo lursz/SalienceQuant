@@ -7,9 +7,10 @@ All methods share one strong low-level quantizer: group-wise asymmetric
 quantization (KIVI/KVQuant style). On top of that:
     - Uniform  : same bits everywhere, per-token axis for both K and V.
     - KIVI     : per-channel K, per-token V, recent residual window in FP16.
-    - Salience : mixed precision — bits allocated per token by importance
+    - Salience : mixed precision - bits allocated per token by importance
                  (attention for V, attention x V-deviation for K), with sinks
-                 and a recent window protected in FP16.
+                 and a recent window protected in FP16, plus TurboQuant
+                 outlier-channel FP16 restore on Keys.
 
 To compare methods fairly we report *effective* bits/element, which includes
 the fp16 scale + zero-point overhead of group-wise quantization.
@@ -48,7 +49,7 @@ def _kv_cache_mb(model: AutoModelForCausalLM, seq_len: int, k_avg_bits: float, v
 #
 # Keys are grouped along the (long) token axis, so the group really holds
 # `group_size` elements. Values are grouped along the head_dim axis, so the
-# group holds at most `head_dim` elements — meaning a large group_size gives
+# group holds at most `head_dim` elements - meaning a large group_size gives
 # values *more* scale/zp overhead than keys. We therefore account K and V
 # separately and report the mean.
 # --------------------------------------------------------------------------
@@ -196,7 +197,7 @@ def _compute_window_importance(
     Value importance  : attention mass received by each key token (H2O-style),
                         normalised by the number of queries that can attend to it.
     Key importance    : received_attention * ||V(t) - mean_output|| * ||Q|| / sqrt(d)
-                        — the V-deviation metric (the method's core contribution).
+                        - the V-deviation metric (the method's core contribution).
 
     Both are aggregated across heads with max (protect a token if *any* head
     needs it) and returned as [seq_len] tensors per layer.
@@ -279,21 +280,15 @@ def _make_salience_proj_hooks(
     protected: dict[str, torch.Tensor],
     tier_config: TierConfig,
     group_size: int,
-    turbo_config: TurboQuantConfig | None,
+    turbo_config: TurboQuantConfig,
 ):
     """Build pass-2 hooks that quantize K/V projections by salience tiers."""
     def make_k_hook(idx):
         def hook(_m, _a, out):
             x = _reshape_kv_proj(out, num_kv_heads, head_dim)
-            if turbo_config is not None:
-                xq = apply_turboquant_key_quant(
-                    x, key_imp[idx], tier_config, protected["mask"], turbo_config,
-                )
-            else:
-                xq = apply_tiered_quant(
-                    x, key_imp[idx], tier_config, quant_dim=2,
-                    protected_mask=protected["mask"], group_size=group_size,
-                )
+            xq = apply_turboquant_key_quant(
+                x, key_imp[idx], tier_config, protected["mask"], turbo_config,
+            )
             return _flatten_kv_proj(xq, num_kv_heads, head_dim)
         return hook
 
@@ -330,8 +325,8 @@ def evaluate_ppl_with_salience_quant(
     Pass 1 (FP16): derive per-token importance from the window's own attention.
     Pass 2: quantize each token to its tier (group-wise asymmetric) and score loss.
 
-    When ``turbo_config`` is set, Keys additionally get TurboQuant outlier-channel
-    FP16 restore (SalienceQuant+).
+    Keys additionally get TurboQuant outlier-channel FP16 restore; ``turbo_config``
+    defaults to TurboQuantConfig().
     """
     if device is None or device == "auto":
         device = next(model.parameters()).device
@@ -339,8 +334,9 @@ def evaluate_ppl_with_salience_quant(
     num_q_heads = model.config.num_attention_heads
     num_kv_groups = num_q_heads // num_kv_heads
     config = tier_config or TierConfig()
-    quant_group_size = turbo_config.group_size if turbo_config else group_size
-    label = method_name or ("SalienceQuant+" if turbo_config else "SalienceQuant")
+    turbo_config = turbo_config or TurboQuantConfig(group_size=group_size)
+    quant_group_size = turbo_config.group_size
+    label = method_name or "SalienceQuant"
 
     if input_ids is None:
         input_ids = load_wikitext2(tokenizer)
@@ -449,19 +445,12 @@ def run_ppl_comparison(
                                      device=device, residual_length=32, group_size=64))
     print("SalienceQuant (~3.3b)...")
     r = evaluate_ppl_with_salience_quant(
-        model, tokenizer, tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.05, int3_pct=0.35),
-        seq_len=seq_len, max_samples=max_samples, device=device,
-        group_size=128, recent_window=16, input_ids=input_ids)
-    r["method"] = "SalienceQuant (~3.3b)"; add(r)
-
-    print("SalienceQuant+ (~3.3b)...")
-    r = evaluate_ppl_with_salience_quant(
         model, tokenizer,
         tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.05, int3_pct=0.35),
         turbo_config=TurboQuantConfig(group_size=128),
         seq_len=seq_len, max_samples=max_samples, device=device,
         group_size=128, recent_window=16, input_ids=input_ids,
-        method_name="SalienceQuant+ (~3.3b)",
+        method_name="SalienceQuant (~3.3b)",
     )
     add(r)
 
@@ -471,19 +460,12 @@ def run_ppl_comparison(
                                      device=device, residual_length=16, group_size=128))
     print("SalienceQuant (~3.7b)...")
     r = evaluate_ppl_with_salience_quant(
-        model, tokenizer, tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.15, int3_pct=0.55),
-        seq_len=seq_len, max_samples=max_samples, device=device,
-        group_size=128, recent_window=16, input_ids=input_ids)
-    r["method"] = "SalienceQuant (~3.7b)"; add(r)
-
-    print("SalienceQuant+ (~3.7b)...")
-    r = evaluate_ppl_with_salience_quant(
         model, tokenizer,
         tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.15, int3_pct=0.55),
         turbo_config=TurboQuantConfig(group_size=128),
         seq_len=seq_len, max_samples=max_samples, device=device,
         group_size=128, recent_window=16, input_ids=input_ids,
-        method_name="SalienceQuant+ (~3.7b)",
+        method_name="SalienceQuant (~3.7b)",
     )
     add(r)
 

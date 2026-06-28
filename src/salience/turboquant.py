@@ -28,7 +28,7 @@ def detect_outlier_channels(
         keys: [batch, heads, seq_len, head_dim]
 
     Returns:
-        [heads, head_dim] bool — True = preserve channel at FP16.
+        [heads, head_dim] bool - True = preserve channel at FP16.
     """
     rms = keys.float().pow(2).mean(dim=(0, 2)).sqrt()
     flat = rms.reshape(-1)
