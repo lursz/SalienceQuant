@@ -16,7 +16,7 @@ QWEN_MODELS = {
 def load_model(
     model_name_or_size: str = "0.5b",
     device: str = "auto",
-    dtype: torch.dtype = torch.float16,
+    dtype: torch.dtype | None = None,
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
     """Load a ML model and tokenizer.
 
@@ -24,11 +24,18 @@ def load_model(
         model_name_or_size: Either a size key ("0.5b", "1.5b", "3b", "7b")
             or a full HuggingFace model name.
         device: Device to load the model on. "auto" uses device_map="auto".
-        dtype: Model dtype (default: float16).
+        dtype: Model dtype. Defaults to bfloat16 when supported (Qwen2.5 is
+            trained in bf16 and overflows fp16 activations), otherwise float16.
 
     Returns:
         Tuple of (model, tokenizer).
     """
+    if dtype is None:
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.float16
+
     model_name = QWEN_MODELS.get(model_name_or_size, model_name_or_size)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)

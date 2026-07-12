@@ -98,16 +98,16 @@ all model=default_model seq_len=default_seq_len samples=default_samples: (recon 
 [doc('Run reconstruction across model sizes: 0.5B, 1.5B, 3B')]
 scaling-recon seq_len=default_seq_len:
     @echo "Model scaling: reconstruction..."
-    @for size in 0.5b 1.5b 3b; do \
+    @for size in 0.5b 1.5b 3b 7b; do \
         echo "\n=== Model: $size ==="; \
         uv run python -m src.experiments.runner -e reconstruction -m $size --seq-len {{seq_len}} -o {{output_dir}}/$size; \
     done
 
 [group('scaling')]
-[doc('Run perplexity across model sizes: 0.5B, 1.5B, 3B')]
+[doc('Run perplexity across model sizes: 0.5B, 1.5B, 3B, 7B')]
 scaling-ppl seq_len=default_seq_len samples=default_samples:
     @echo "Model scaling: perplexity..."
-    @for size in 0.5b 1.5b 3b; do \
+    @for size in 0.5b 1.5b 3b 7b; do \
         echo "\n=== Model: $size ==="; \
         uv run python -m src.experiments.runner -e perplexity -m $size --seq-len {{seq_len}} --max-samples {{samples}} -o {{output_dir}}/$size; \
     done

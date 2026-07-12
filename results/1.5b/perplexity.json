@@ -1,0 +1,65 @@
+[
+  {
+    "perplexity": 10.527774810791016,
+    "loss": 2.3540169823644677,
+    "num_tokens": 1531,
+    "seq_len": 512,
+    "method": "FP16 (baseline)",
+    "avg_bits": 16.0,
+    "kv_mb": 14.0
+  },
+  {
+    "perplexity": 55324.27734375,
+    "loss": 10.920966688438929,
+    "num_tokens": 1531,
+    "seq_len": 512,
+    "method": "Uniform INT4",
+    "avg_bits": 4.5,
+    "kv_mb": 3.9375
+  },
+  {
+    "perplexity": 40.32332992553711,
+    "loss": 3.696930111038537,
+    "num_tokens": 1531,
+    "seq_len": 512,
+    "method": "KIVI 2-bit",
+    "avg_bits": 3.34375,
+    "kv_mb": 2.92578125
+  },
+  {
+    "perplexity": 34.65337371826172,
+    "loss": 3.5453951665578054,
+    "num_tokens": 1531,
+    "seq_len": 512,
+    "method": "SalienceQuant (~3.3b)",
+    "avg_bits": 3.2195312499999997,
+    "kv_mb": 2.81708984375
+  },
+  {
+    "perplexity": 14.404454231262207,
+    "loss": 2.667537557152188,
+    "num_tokens": 1531,
+    "seq_len": 512,
+    "method": "KIVI 3-bit",
+    "avg_bits": 3.6484375,
+    "kv_mb": 3.1923828125
+  },
+  {
+    "perplexity": 16.033126831054688,
+    "loss": 2.774657086871326,
+    "num_tokens": 1531,
+    "seq_len": 512,
+    "method": "SalienceQuant (~3.7b)",
+    "avg_bits": 3.6039062499999996,
+    "kv_mb": 3.1534179687499995
+  },
+  {
+    "perplexity": 11.17979907989502,
+    "loss": 2.4141084258654475,
+    "num_tokens": 1531,
+    "seq_len": 512,
+    "method": "KIVI 4-bit",
+    "avg_bits": 4.859375,
+    "kv_mb": 4.251953125
+  }
+]
