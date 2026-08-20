@@ -9,8 +9,9 @@ quantization (KIVI/KVQuant style). On top of that:
     - KIVI     : per-channel K, per-token V, recent residual window in FP16.
     - Salience : mixed precision - bits allocated per token by importance
                  (attention for V, attention x V-deviation for K), with sinks
-                 and a recent window protected in FP16, plus TurboQuant
-                 outlier-channel FP16 restore on Keys.
+                 and a recent window protected in FP16. Optional TurboQuant
+                 quantizer hardening (rotation / normal codebook / channel
+                 overlay) is available via TurboQuantConfig but off by default.
 
 To compare methods fairly we report *effective* bits/element, which includes
 the fp16 scale + zero-point overhead of group-wise quantization.
@@ -26,7 +27,9 @@ from src.shared.hooks import make_proj_quant_hook, make_residual_proj_hook, DEFA
 from src.shared.quantize import grouped_effective_bits
 from src.salience.tiered import TierConfig, apply_tiered_quant
 from src.salience.scoring.sink_detector import get_protected_mask
-from src.salience.turboquant import TurboQuantConfig, apply_turboquant_key_quant
+from src.salience.turboquant import (
+    TurboQuantConfig, apply_turboquant_key_quant, random_rotation,
+)
 
 
 def _get_kv_config(model: AutoModelForCausalLM) -> tuple[int, int]:
@@ -81,23 +84,45 @@ def _kivi_eff_bits(
 
 
 def _salience_eff_bits(
-    config: TierConfig, protected_frac: float, group_size: int, head_dim: int
+    config: TierConfig,
+    protected_frac: float,
+    group_size: int,
+    head_dim: int,
+    turbo_channel_frac: float = 0.0,
+    turbo_overlay_bits: int = 16,
 ) -> tuple[float, float]:
     """Effective bits/element for the tiered scheme, returned as (key, value).
 
     Protected tokens (sinks + recent) are FP16. The rest are split across tiers
     (group-wise asymmetric), and we include the scale+zp overhead per tier.
+
+    ``turbo_channel_frac`` is the fraction of key channels the TurboQuant
+    overlay protects: those channels cost the overlay's own effective bits
+    (16 for FP16 restore, grouped INT cost otherwise) regardless of the
+    token's tier. FP16-tier tokens never pay the overlay.
     """
     from src.salience.tiered import TIER_BITS
 
-    def avg(eff_fn):
+    overlay_cost = (
+        16.0 if turbo_overlay_bits >= 16
+        else _key_eff_bits(turbo_overlay_bits, group_size)
+    )
+    if turbo_channel_frac > 0:
+        # detect_outlier_channels rounds to whole channels per head
+        turbo_channel_frac = max(1, int(head_dim * turbo_channel_frac)) / head_dim
+
+    def avg(eff_fn, overlay_frac=0.0):
+        def per_elem(bits):
+            if bits == 16:
+                return 16.0
+            return overlay_frac * overlay_cost + (1 - overlay_frac) * eff_fn(bits)
+
         non_protected = sum(
-            frac * (16 if TIER_BITS[tier] == 16 else eff_fn(TIER_BITS[tier]))
-            for frac, tier in config.tiers()
+            frac * per_elem(TIER_BITS[tier]) for frac, tier in config.tiers()
         )
         return protected_frac * 16 + (1 - protected_frac) * non_protected
 
-    k = avg(lambda b: _key_eff_bits(b, group_size))
+    k = avg(lambda b: _key_eff_bits(b, group_size), overlay_frac=turbo_channel_frac)
     v = avg(lambda b: _val_eff_bits(b, group_size, head_dim))
     return k, v
 
@@ -295,9 +320,14 @@ def _make_salience_proj_hooks(
     def make_v_hook(idx):
         def hook(_m, _a, out):
             x = _reshape_kv_proj(out, num_kv_heads, head_dim)
+            rotation = (
+                random_rotation(head_dim, device=x.device)
+                if turbo_config.rotate else None
+            )
             xq = apply_tiered_quant(
                 x, val_imp[idx], tier_config, quant_dim=-1,
                 protected_mask=protected["mask"], group_size=group_size,
+                rotation=rotation, codebook=turbo_config.codebook,
             )
             return _flatten_kv_proj(xq, num_kv_heads, head_dim)
         return hook
@@ -325,8 +355,8 @@ def evaluate_ppl_with_salience_quant(
     Pass 1 (FP16): derive per-token importance from the window's own attention.
     Pass 2: quantize each token to its tier (group-wise asymmetric) and score loss.
 
-    Keys additionally get TurboQuant outlier-channel FP16 restore; ``turbo_config``
-    defaults to TurboQuantConfig().
+    ``turbo_config`` (default TurboQuantConfig()) controls optional quantizer
+    hardening: rotated-basis quant, normal codebook, and the channel overlay.
     """
     if device is None or device == "auto":
         device = next(model.parameters()).device
@@ -393,7 +423,11 @@ def evaluate_ppl_with_salience_quant(
 
     avg_loss = total_loss / total_tokens
     protected_frac = min(num_sink_tokens + recent_window, seq_len) / seq_len
-    k_eff, v_eff = _salience_eff_bits(config, protected_frac, quant_group_size, head_dim)
+    k_eff, v_eff = _salience_eff_bits(
+        config, protected_frac, quant_group_size, head_dim,
+        turbo_channel_frac=turbo_config.channel_fraction,
+        turbo_overlay_bits=turbo_config.overlay_bits,
+    )
     return {
         "perplexity": torch.exp(torch.tensor(avg_loss)).item(),
         "loss": avg_loss,
@@ -411,6 +445,7 @@ def run_ppl_comparison(
     seq_len: int = 2048,
     max_samples: int = 5,
     device: str | None = None,
+    turbo: str = "off",
 ) -> list[dict]:
     """Run a perplexity comparison across methods at matched effective bits.
 
@@ -418,9 +453,19 @@ def run_ppl_comparison(
     SalienceQuant can be compared head-to-head. The decisive comparison is the
     lossy regime (≤~4 bits): there KIVI's uniform low-bit quantization degrades
     sharply while SalienceQuant protects important tokens.
+
+    ``turbo`` selects TurboQuant hardening for the SalienceQuant runs:
+    "off", "rot", "normal", or "rot-normal" (rotation + normal codebook).
     """
     if device is None or device == "auto":
         device = next(model.parameters()).device
+
+    turbo_config = TurboQuantConfig(
+        group_size=128,
+        rotate="rot" in turbo,
+        codebook="normal" if "normal" in turbo else "uniform",
+    )
+    turbo_tag = "" if turbo == "off" else f" [{turbo}]"
 
     input_ids = load_wikitext2(tokenizer).to(device)
     results = []
@@ -440,17 +485,19 @@ def run_ppl_comparison(
 
     # --- ~3.3 effective bits: the aggressive regime where KIVI hits its cliff.
     #     KIVI cannot fit 3-bit here (needs >=~3.5 eff bits) so it must use 2-bit.
+    #     Salience budgets are fully billed and sit at or below the KIVI budget
+    #     they are paired with.
     print("KIVI 2-bit (~3.3b)...")
     add(evaluate_ppl_with_kivi_quant(model, tokenizer, bits=2, seq_len=seq_len, max_samples=max_samples,
                                      device=device, residual_length=32, group_size=64))
     print("SalienceQuant (~3.3b)...")
     r = evaluate_ppl_with_salience_quant(
         model, tokenizer,
-        tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.05, int3_pct=0.35),
-        turbo_config=TurboQuantConfig(group_size=128),
+        tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.0, int3_pct=0.45),
+        turbo_config=turbo_config,
         seq_len=seq_len, max_samples=max_samples, device=device,
         group_size=128, recent_window=16, input_ids=input_ids,
-        method_name="SalienceQuant (~3.3b)",
+        method_name=f"SalienceQuant (~3.3b){turbo_tag}",
     )
     add(r)
 
@@ -462,10 +509,10 @@ def run_ppl_comparison(
     r = evaluate_ppl_with_salience_quant(
         model, tokenizer,
         tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.15, int3_pct=0.55),
-        turbo_config=TurboQuantConfig(group_size=128),
+        turbo_config=turbo_config,
         seq_len=seq_len, max_samples=max_samples, device=device,
         group_size=128, recent_window=16, input_ids=input_ids,
-        method_name="SalienceQuant (~3.7b)",
+        method_name=f"SalienceQuant (~3.7b){turbo_tag}",
     )
     add(r)
 

@@ -400,6 +400,70 @@ class TestTurboQuant:
         )
         assert (keys - turbo).pow(2).mean() <= (keys - tiered).pow(2).mean()
 
+    def test_normal_codebook_beats_uniform_on_gaussian_int2(self):
+        """Lloyd-Max levels are MSE-optimal for Gaussian data at low bits."""
+        from src.shared.quantize import quantize_dequantize_grouped
+        torch.manual_seed(0)
+        x = torch.randn(1, 2, 512, 64)
+        uni = quantize_dequantize_grouped(x, 2, axis=2, group_size=128, codebook="uniform")
+        llo = quantize_dequantize_grouped(x, 2, axis=2, group_size=128, codebook="normal")
+        assert (x - llo).pow(2).mean() < (x - uni).pow(2).mean()
+
+    def test_random_rotation_is_orthogonal_and_deterministic(self):
+        from src.salience.turboquant import random_rotation
+        r1 = random_rotation(64, seed=0)
+        r2 = random_rotation(64, seed=0)
+        assert torch.equal(r1, r2)
+        assert torch.allclose(r1 @ r1.T, torch.eye(64), atol=1e-5)
+        x = torch.randn(1, 2, 32, 64)
+        assert torch.allclose((x.float() @ r1.T) @ r1, x, atol=1e-5)
+
+    def test_int8_overlay_matches_fp16_overlay_quality(self):
+        """INT8 channel storage should be near-lossless vs FP16 restore, and cheaper."""
+        from src.salience.tiered import TieredQuantizer, TierConfig, assign_tiers
+        from src.salience.turboquant import detect_outlier_channels
+
+        torch.manual_seed(0)
+        k = torch.randn(1, 2, 512, 64)
+        k[:, :, :, ::8] *= 6.0
+        v = torch.randn(1, 2, 512, 64)
+        scores = torch.rand(512)
+        protected = torch.zeros(512, dtype=torch.bool)
+        tiers = assign_tiers(scores, protected, TierConfig(0.0, 0.0, 0.0, 0.3))
+        mask = detect_outlier_channels(k, 0.10)
+
+        def run(bits):
+            q = TieredQuantizer()
+            q.quantize_and_store(k, v, tiers, key_outlier_overlay=(mask, k.clone()),
+                                 key_overlay_bits=bits)
+            kd, _ = q.dequantize()
+            return (k - kd).pow(2).mean().item(), q.memory_bytes()["total"]
+
+        mse16, mem16 = run(16)
+        mse8, mem8 = run(8)
+        assert mse8 < mse16 * 1.05  # near-identical protection quality
+        assert mem8 < mem16          # at lower billed memory
+
+    def test_overlay_does_not_degrade_fp16_tier_tokens(self):
+        from src.salience.tiered import TieredQuantizer, TierConfig, assign_tiers, Tier
+        from src.salience.turboquant import detect_outlier_channels
+
+        torch.manual_seed(0)
+        k = torch.randn(1, 2, 128, 64)
+        v = torch.randn(1, 2, 128, 64)
+        scores = torch.rand(128)
+        protected = torch.zeros(128, dtype=torch.bool)
+        protected[:8] = True
+        tiers = assign_tiers(scores, protected, TierConfig())
+        mask = detect_outlier_channels(k, 0.10)
+
+        q = TieredQuantizer()
+        q.quantize_and_store(k, v, tiers, key_outlier_overlay=(mask, k.clone()),
+                             key_overlay_bits=8)
+        kd, _ = q.dequantize()
+        fp16_idx = (tiers == int(Tier.FP16)).nonzero(as_tuple=True)[0]
+        assert torch.allclose(k[:, :, fp16_idx, :], kd[:, :, fp16_idx, :], atol=1e-5)
+
     def test_salience_cache_with_turbo(self):
         from src.salience.cache import SalienceCache
         from src.salience.turboquant import TurboQuantConfig

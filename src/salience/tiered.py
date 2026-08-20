@@ -132,8 +132,15 @@ class TieredQuantizer:
     Supports separate tier assignments for Keys and Values (asymmetric scoring).
     """
 
-    def __init__(self, group_size: int = 64):
+    def __init__(
+        self,
+        group_size: int = 64,
+        codebook: str = "uniform",
+        rotation: torch.Tensor | None = None,
+    ):
         self.group_size = group_size
+        self.codebook = codebook
+        self.rotation = rotation  # optional TurboQuant-style rotated-basis quant
         # Per-tier storage: tier -> (GroupedQuant,) for quantized tiers, (raw,) for FP16
         self._key_tiers: dict[Tier, tuple] = {}
         self._value_tiers: dict[Tier, tuple] = {}
@@ -145,8 +152,11 @@ class TieredQuantizer:
         # Fisher scale factors for dequantization (SmoothQuant-style)
         self._key_fisher_scale: torch.Tensor | None = None
         self._value_fisher_scale: torch.Tensor | None = None
-        # TurboQuant: FP16 overlay for outlier key channels (mask, source keys)
-        self._key_outlier_overlay: tuple[torch.Tensor, torch.Tensor] | None = None
+        # TurboQuant overlay for outlier key channels:
+        #   (mask, source) with overlay_bits=16 (FP16 restore), or
+        #   (mask, GroupedQuant) with overlay_bits<16 (INT storage)
+        self._key_outlier_overlay: tuple | None = None
+        self._key_overlay_bits: int = 16
 
     def quantize_and_store(
         self,
@@ -157,6 +167,7 @@ class TieredQuantizer:
         key_fisher_weights: torch.Tensor | None = None,
         value_fisher_weights: torch.Tensor | None = None,
         key_outlier_overlay: tuple[torch.Tensor, torch.Tensor] | None = None,
+        key_overlay_bits: int = 16,
     ):
         """Quantize and store KV states according to tier assignments.
 
@@ -171,8 +182,13 @@ class TieredQuantizer:
                 Fisher get more of the quantization range, reducing their error.
             value_fisher_weights: [num_kv_heads, head_dim] Fisher weights for values.
             key_outlier_overlay: Optional ``(outlier_mask, source_keys)`` for
-                TurboQuant channel restore on dequantize. ``outlier_mask`` is
-                ``[heads, head_dim]`` bool; ``source_keys`` is the pre-quant FP16 keys.
+                TurboQuant channel protection on dequantize. ``outlier_mask`` is
+                ``[heads, head_dim]`` bool with equal count per head;
+                ``source_keys`` is the pre-quant FP16 keys.
+            key_overlay_bits: Precision of the protected channels. 16 keeps a
+                raw FP16 copy; lower values store them as a group-wise INT
+                quantization along the token axis (near-lossless at 8 bits,
+                much cheaper than FP16).
         """
         if value_tier_assignments is None:
             value_tier_assignments = key_tier_assignments
@@ -185,7 +201,15 @@ class TieredQuantizer:
         # and reversed after, giving high-Fisher channels more of the range.
         self._key_fisher_scale = self._fisher_scale(key_fisher_weights)
         self._value_fisher_scale = self._fisher_scale(value_fisher_weights)
-        self._key_outlier_overlay = key_outlier_overlay
+        self._key_overlay_bits = key_overlay_bits
+        if key_outlier_overlay is None or key_overlay_bits >= 16:
+            self._key_outlier_overlay = key_outlier_overlay
+        else:
+            from src.salience.turboquant import gather_outlier_channels
+            mask, source = key_outlier_overlay
+            gathered = gather_outlier_channels(source, mask)
+            self._key_outlier_overlay = (mask, quantize_grouped(
+                gathered, key_overlay_bits, axis=2, group_size=self.group_size))
 
         # Keys group along the token axis (per-channel); Values along head_dim (per-token).
         self._key_tiers, self._key_tier_indices = self._store_side(
@@ -218,8 +242,11 @@ class TieredQuantizer:
             else:
                 if fisher_scale is not None:
                     chunk = chunk * fisher_scale.unsqueeze(0).unsqueeze(2)  # [1, heads, 1, head_dim]
+                if self.rotation is not None:
+                    chunk = chunk.float() @ self.rotation.T
                 tiers[tier] = (quantize_grouped(
-                    chunk, TIER_BITS[tier], axis=axis, group_size=self.group_size),)
+                    chunk, TIER_BITS[tier], axis=axis, group_size=self.group_size,
+                    codebook=self.codebook),)
         return tiers, indices
 
     def dequantize(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -231,13 +258,30 @@ class TieredQuantizer:
         keys = torch.zeros(batch, heads, self._seq_len, head_dim,
                            device=self._device, dtype=torch.float)
         values = torch.zeros_like(keys)
-        self._restore_side(keys, self._key_tiers, self._key_tier_indices, self._key_fisher_scale)
-        self._restore_side(values, self._value_tiers, self._value_tier_indices, self._value_fisher_scale)
+        self._restore_side(keys, self._key_tiers, self._key_tier_indices,
+                           self._key_fisher_scale, self.rotation)
+        self._restore_side(values, self._value_tiers, self._value_tier_indices,
+                           self._value_fisher_scale, self.rotation)
         if self._key_outlier_overlay is not None:
-            from src.salience.turboquant import apply_outlier_channel_overlay
-            mask, source = self._key_outlier_overlay
-            keys = apply_outlier_channel_overlay(keys, source.float(), mask)
+            keys = self._apply_key_overlay(keys)
         return keys, values
+
+    def _apply_key_overlay(self, keys: torch.Tensor) -> torch.Tensor:
+        """Overlay protected channels onto quantized-tier tokens (FP16 tokens are exact already)."""
+        from src.salience.turboquant import (
+            apply_outlier_channel_overlay, scatter_outlier_channels,
+        )
+        mask, stored = self._key_outlier_overlay
+        if self._key_overlay_bits >= 16:
+            source = stored.float()
+        else:
+            source = scatter_outlier_channels(
+                torch.zeros_like(keys), dequantize_grouped(stored), mask)
+        token_mask = torch.zeros(self._seq_len, dtype=torch.bool, device=keys.device)
+        for tier, idx in self._key_tier_indices.items():
+            if tier != Tier.FP16:
+                token_mask[idx] = True
+        return apply_outlier_channel_overlay(keys, source, mask.to(keys.device), token_mask)
 
     @staticmethod
     def _restore_side(
@@ -245,6 +289,7 @@ class TieredQuantizer:
         tiers: dict,
         indices: dict,
         fisher_scale: torch.Tensor | None,
+        rotation: torch.Tensor | None = None,
     ):
         """Scatter each tier's dequantized tokens back into `out` (in place)."""
         for tier, idx in indices.items():
@@ -252,6 +297,8 @@ class TieredQuantizer:
                 deq = tiers[tier][0].float()
             else:
                 deq = dequantize_grouped(tiers[tier][0])
+                if rotation is not None:  # back to the original basis
+                    deq = deq @ rotation.to(deq.device)
                 if fisher_scale is not None:  # reverse the sqrt(Fisher) pre-scaling
                     deq = deq / fisher_scale.unsqueeze(0).unsqueeze(2).to(deq.device)
             out[:, :, idx, :] = deq
@@ -263,22 +310,56 @@ class TieredQuantizer:
         FP16 tier reports 2 bytes/elem (the tier's intended precision, regardless
         of the actual PyTorch dtype which may be float32 during testing).
         Scale tensors report actual size.
+
+        TurboQuant-protected key channels are charged at the overlay's own
+        precision instead of their tier's packed size - a real layout would not
+        store tier codes for channels the overlay replaces, and billing the
+        overlay at tier bits would overstate the compression ratio. With
+        ``overlay_bits=16`` this means 2 bytes/elem; with INT overlay bits the
+        overlay's actual GroupedQuant size is reported under ``KEY_OVERLAY``.
         """
         result = {}
         total = 0
+        overlay = self._key_outlier_overlay
+        overlay_channel_frac = 0.0
+        if overlay is not None and self._key_overlay_bits < 16:
+            mask = overlay[0]
+            overlay_channel_frac = int(mask.sum()) / mask.numel()
+
         for tier in Tier:
             tier_bytes = 0
-            for storage in [self._key_tiers, self._value_tiers]:
-                if tier in storage:
-                    data = storage[tier]
-                    if tier == Tier.FP16:
-                        # FP16: 2 bytes/element (logical FP16 size)
-                        tier_bytes += data[0].nelement() * 2
-                    else:
-                        # Quantized: GroupedQuant (codes + fp16 scale/zp)
-                        tier_bytes += data[0].memory_bytes()
+            for side, storage in (("key", self._key_tiers), ("value", self._value_tiers)):
+                if tier not in storage:
+                    continue
+                data = storage[tier]
+                if tier == Tier.FP16:
+                    # FP16: 2 bytes/element (logical FP16 size)
+                    tier_bytes += data[0].nelement() * 2
+                else:
+                    # Quantized: GroupedQuant (codes + fp16 scale/zp)
+                    side_bytes = data[0].memory_bytes()
+                    if side == "key" and overlay is not None:
+                        if self._key_overlay_bits >= 16:
+                            # FP16 restore: re-bill overlay elements at 2 bytes
+                            mask = overlay[0]
+                            batch = self._shape[0]
+                            n_tokens = self._key_tier_indices[tier].numel()
+                            outlier_elems = batch * n_tokens * int(mask.sum())
+                            side_bytes += int(outlier_elems * (2 - TIER_BITS[tier] / 8))
+                        else:
+                            # INT overlay replaces those channels entirely; keys
+                            # group along the token axis, so codes AND scales
+                            # shrink proportionally with the dropped channels
+                            side_bytes = int(side_bytes * (1 - overlay_channel_frac))
+                    tier_bytes += side_bytes
             result[tier.name] = tier_bytes
             total += tier_bytes
+
+        if overlay is not None and self._key_overlay_bits < 16:
+            overlay_bytes = overlay[1].memory_bytes()
+            result["KEY_OVERLAY"] = overlay_bytes
+            total += overlay_bytes
+
         result["total"] = total
         return result
 
@@ -290,6 +371,8 @@ def apply_tiered_quant(
     quant_dim: int,
     protected_mask: torch.Tensor | None = None,
     group_size: int = 64,
+    rotation: torch.Tensor | None = None,
+    codebook: str = "uniform",
 ) -> torch.Tensor:
     """Apply tiered group-wise quantization to a KV tensor by per-token importance.
 
@@ -306,6 +389,10 @@ def apply_tiered_quant(
             -1 -> per-token  (for Values, group along head_dim axis)
         protected_mask: [seq_len] bool, True = always FP16 (sinks + recent).
         group_size: Quantization group size.
+        rotation: Optional [head_dim, head_dim] orthogonal matrix. Tiers are
+            quantized in the rotated basis and rotated back (TurboQuant-style
+            outlier spreading; costs no stored bits when seed-derived).
+        codebook: Per-group codebook for quantized tiers ("uniform"/"normal").
 
     Returns:
         Tensor with same shape, quantized per-tier.
@@ -328,9 +415,16 @@ def apply_tiered_quant(
         idx = ranked[tier_of == int(tier)]
         if idx.numel() == 0:
             continue
-        result[:, :, idx, :] = quantize_dequantize_grouped(
-            tensor[:, :, idx, :], bits=TIER_BITS[tier],
+        chunk = tensor[:, :, idx, :]
+        if rotation is not None:
+            chunk = chunk.float() @ rotation.T
+        deq = quantize_dequantize_grouped(
+            chunk, bits=TIER_BITS[tier],
             axis=quant_dim, group_size=group_size, symmetric=False,
-        ).to(tensor.dtype)
+            codebook=codebook,
+        )
+        if rotation is not None:
+            deq = deq @ rotation
+        result[:, :, idx, :] = deq.to(tensor.dtype)
 
     return result
