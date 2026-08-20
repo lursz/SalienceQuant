@@ -8,6 +8,7 @@ set dotenv-load := false
 default_model := "0.5b"
 default_seq_len := "512"
 default_samples := "5"
+default_turbo := "off"
 output_dir := "results"
 
 # ---------- Testing ----------
@@ -76,10 +77,10 @@ ablation model=default_model seq_len=default_seq_len:
     uv run python -m src.experiments.runner -e ablation -m {{model}} --seq-len {{seq_len}} -o {{output_dir}}
 
 [group('model')]
-[doc('Perplexity evaluation across all methods')]
-perplexity model=default_model seq_len=default_seq_len samples=default_samples:
-    @echo "Perplexity evaluation (model={{model}}, seq_len={{seq_len}}, samples={{samples}})..."
-    uv run python -m src.experiments.runner -e perplexity -m {{model}} --seq-len {{seq_len}} --max-samples {{samples}} -o {{output_dir}}
+[doc('Perplexity evaluation across all methods (turbo=off|rot|normal|rot-normal)')]
+perplexity model=default_model seq_len=default_seq_len samples=default_samples turbo=default_turbo:
+    @echo "Perplexity evaluation (model={{model}}, seq_len={{seq_len}}, samples={{samples}}, turbo={{turbo}})..."
+    uv run python -m src.experiments.runner -e perplexity -m {{model}} --seq-len {{seq_len}} --max-samples {{samples}} --turbo {{turbo}} -o {{ if turbo == "off" { output_dir } else { output_dir / turbo } }}
 
 [group('model')]
 [doc('Tier config sweep (Pareto frontier) with real model')]
@@ -104,12 +105,12 @@ scaling-recon seq_len=default_seq_len:
     done
 
 [group('scaling')]
-[doc('Run perplexity across model sizes: 0.5B, 1.5B, 3B, 7B')]
-scaling-ppl seq_len=default_seq_len samples=default_samples:
-    @echo "Model scaling: perplexity..."
+[doc('Run perplexity across model sizes: 0.5B, 1.5B, 3B, 7B (turbo=off|rot|normal|rot-normal)')]
+scaling-ppl seq_len=default_seq_len samples=default_samples turbo=default_turbo:
+    @echo "Model scaling: perplexity (turbo={{turbo}})..."
     @for size in 0.5b 1.5b 3b 7b; do \
         echo "\n=== Model: $size ==="; \
-        uv run python -m src.experiments.runner -e perplexity -m $size --seq-len {{seq_len}} --max-samples {{samples}} -o {{output_dir}}/$size; \
+        uv run python -m src.experiments.runner -e perplexity -m $size --seq-len {{seq_len}} --max-samples {{samples}} --turbo {{turbo}} -o {{ if turbo == "off" { output_dir } else { output_dir / turbo } }}/$size; \
     done
 
 # ---------- Utilities ----------

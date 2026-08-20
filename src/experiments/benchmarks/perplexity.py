@@ -445,6 +445,7 @@ def run_ppl_comparison(
     seq_len: int = 2048,
     max_samples: int = 5,
     device: str | None = None,
+    turbo: str = "off",
 ) -> list[dict]:
     """Run a perplexity comparison across methods at matched effective bits.
 
@@ -452,9 +453,19 @@ def run_ppl_comparison(
     SalienceQuant can be compared head-to-head. The decisive comparison is the
     lossy regime (≤~4 bits): there KIVI's uniform low-bit quantization degrades
     sharply while SalienceQuant protects important tokens.
+
+    ``turbo`` selects TurboQuant hardening for the SalienceQuant runs:
+    "off", "rot", "normal", or "rot-normal" (rotation + normal codebook).
     """
     if device is None or device == "auto":
         device = next(model.parameters()).device
+
+    turbo_config = TurboQuantConfig(
+        group_size=128,
+        rotate="rot" in turbo,
+        codebook="normal" if "normal" in turbo else "uniform",
+    )
+    turbo_tag = "" if turbo == "off" else f" [{turbo}]"
 
     input_ids = load_wikitext2(tokenizer).to(device)
     results = []
@@ -483,10 +494,10 @@ def run_ppl_comparison(
     r = evaluate_ppl_with_salience_quant(
         model, tokenizer,
         tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.0, int3_pct=0.45),
-        turbo_config=TurboQuantConfig(group_size=128),
+        turbo_config=turbo_config,
         seq_len=seq_len, max_samples=max_samples, device=device,
         group_size=128, recent_window=16, input_ids=input_ids,
-        method_name="SalienceQuant (~3.3b)",
+        method_name=f"SalienceQuant (~3.3b){turbo_tag}",
     )
     add(r)
 
@@ -498,10 +509,10 @@ def run_ppl_comparison(
     r = evaluate_ppl_with_salience_quant(
         model, tokenizer,
         tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.15, int3_pct=0.55),
-        turbo_config=TurboQuantConfig(group_size=128),
+        turbo_config=turbo_config,
         seq_len=seq_len, max_samples=max_samples, device=device,
         group_size=128, recent_window=16, input_ids=input_ids,
-        method_name="SalienceQuant (~3.7b)",
+        method_name=f"SalienceQuant (~3.7b){turbo_tag}",
     )
     add(r)
 
