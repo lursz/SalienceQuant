@@ -31,6 +31,27 @@ class AblationResult:
     metrics: ReconstructionMetrics
 
 
+def _replay_attention_blocks(
+    update_fn,
+    states: CapturedStates,
+    block_size: int = 64,
+):
+    """Replay captured attention as sequential query blocks.
+
+    A single bulk update collapses the tracker's EMA to its first-observation
+    path (scores = attn, alpha unused). Feeding the window as consecutive
+    blocks - each covering only the KV prefix visible to its queries -
+    reproduces the streaming updates the tracker receives during generation,
+    so alpha actually shapes the scores.
+    """
+    for layer_idx in sorted(states.attention_weights.keys()):
+        attn = states.attention_weights[layer_idx]
+        seq = attn.size(2)
+        for start in range(0, seq, block_size):
+            end = min(start + block_size, seq)
+            update_fn(layer_idx, attn[:, :, start:end, :end])
+
+
 def _uniform_quantize_kv(
     keys: torch.Tensor, values: torch.Tensor, bits: int
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
@@ -191,10 +212,12 @@ def run_ablation(
     results.append(AblationResult("+Sinks", ["uniform", "attention", "multi-tier", "sinks"], metrics))
 
     # ---- Ablation 5: +EMA decay ----
+    # Streamed block updates so alpha matters: recency-weighted scores
+    # vs. the whole-window average of rows 2-4.
     ema_tracker = AttentionTracker(num_layers, num_kv_heads, alpha=0.2)
-    for layer_idx in sorted(states.attention_weights.keys()):
-        attn = states.attention_weights[layer_idx]
-        ema_tracker.update(layer_idx, attn, num_kv_groups)
+    _replay_attention_blocks(
+        lambda idx, attn: ema_tracker.update(idx, attn, num_kv_groups), states,
+    )
 
     approx_k_list, approx_v_list, total_mem = [], [], 0
     for layer_idx in sorted(states.keys.keys()):
@@ -219,11 +242,15 @@ def run_ablation(
     results.append(AblationResult("+EMA decay", ["uniform", "attention", "multi-tier", "sinks", "ema"], metrics))
 
     # ---- Ablation 6: +V-deviation (Key Fisher) ----
+    # Value importance streamed like row 5 (cumulative ablation); the
+    # V-deviation key metric is computed once on the full window, as in
+    # SalienceCache's periodic re-scoring.
     scorer = ImportanceScorer(num_layers, num_kv_heads, alpha=0.2)
+    _replay_attention_blocks(
+        lambda idx, attn: scorer.update_attention(idx, attn, num_kv_groups), states,
+    )
     for layer_idx in sorted(states.attention_weights.keys()):
         attn = states.attention_weights[layer_idx]
-        scorer.update_attention(layer_idx, attn, num_kv_groups)
-
         q = states.query_states.get(layer_idx)
         v = states.values.get(layer_idx)
         out = states.attention_outputs.get(layer_idx)

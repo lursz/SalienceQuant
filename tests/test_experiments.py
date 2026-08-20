@@ -155,6 +155,30 @@ class TestAblation:
         table = format_ablation_table(results)
         assert "Uniform INT4" in table
 
+    def test_ema_replay_is_alpha_sensitive(self):
+        """Regression: the +EMA ablation row must actually depend on alpha.
+
+        A single bulk tracker update hits the first-observation path where
+        alpha is unused, making the row identical to the non-EMA one. The
+        streamed replay must produce alpha-dependent scores.
+        """
+        import torch
+        from src.experiments.infra.capture import generate_synthetic_states
+        from src.experiments.benchmarks.ablation import _replay_attention_blocks
+        from src.salience.scoring.attention_tracker import AttentionTracker
+
+        states = generate_synthetic_states(
+            num_layers=1, num_kv_heads=2, num_q_heads=4, seq_len=256
+        )
+        scores = {}
+        for alpha in (1.0, 0.2):
+            tracker = AttentionTracker(num_layers=1, num_kv_heads=2, alpha=alpha)
+            _replay_attention_blocks(
+                lambda idx, attn: tracker.update(idx, attn, num_kv_groups=2), states,
+            )
+            scores[alpha] = tracker.get_token_importance(0)
+        assert not torch.allclose(scores[1.0], scores[0.2])
+
     def test_ablation_with_budget(self):
         from src.experiments.infra.capture import generate_synthetic_states
         from src.experiments.benchmarks.ablation import run_ablation
