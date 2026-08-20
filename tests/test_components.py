@@ -88,6 +88,27 @@ class TestKIVIQuantization:
         # Last 32 tokens should be exact (FP16 residual)
         assert torch.allclose(k[:, :, -32:, :], k_out[:, :, -32:, :], atol=1e-5)
 
+    def test_streaming_updates_keep_all_tokens(self):
+        """Regression: decode-style updates must not drop the quantized prefix."""
+        from src.kivi.cache import KIVIQuantizedKVCache
+        torch.manual_seed(0)
+        cache = KIVIQuantizedKVCache(bits=8, residual_length=32, group_size=64)
+        k = torch.randn(1, 2, 300, 64)
+        v = torch.randn(1, 2, 300, 64)
+
+        cache.update(k[:, :, :200, :], v[:, :, :200, :], layer_idx=0)  # prefill
+        for t in range(200, 300):                                       # decode
+            cache.update(k[:, :, t:t + 1, :], v[:, :, t:t + 1, :], layer_idx=0)
+
+        k_out, v_out = cache.get_kv(0)
+        assert k_out.shape[2] == 300
+        assert v_out.shape[2] == 300
+        # earliest tokens must survive with only INT8-level error
+        assert (k[:, :, :64, :] - k_out[:, :, :64, :]).pow(2).mean() < 1e-3
+        assert (v[:, :, :64, :] - v_out[:, :, :64, :]).pow(2).mean() < 1e-3
+        # most recent tokens are exact FP16 residual
+        assert torch.allclose(k[:, :, -32:, :], k_out[:, :, -32:, :], atol=1e-5)
+
 
 # --- Scoring components ---
 

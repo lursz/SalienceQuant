@@ -41,7 +41,7 @@ class KIVIQuantizedKVCache:
         self.group_size = group_size
 
         # layer_idx -> {"full_k", "full_v": FP16 residual tensors,
-        #               "gq_k", "gq_v": GroupedQuant of the older tokens (or None)}
+        #               "chunks_k", "chunks_v": [GroupedQuant] of older token blocks}
         self._cache: dict[int, dict] = {}
 
     def update(
@@ -62,41 +62,43 @@ class KIVIQuantizedKVCache:
             self._cache[layer_idx] = {
                 "full_k": key_states,
                 "full_v": value_states,
-                "gq_k": None,
-                "gq_v": None,
+                "chunks_k": [],
+                "chunks_v": [],
             }
-            self._maybe_quantize(layer_idx)
-            return
-
-        entry = self._cache[layer_idx]
-
-        # Append new tokens
-        entry["full_k"] = torch.cat([entry["full_k"], key_states], dim=2)
-        entry["full_v"] = torch.cat([entry["full_v"], value_states], dim=2)
+        else:
+            entry = self._cache[layer_idx]
+            entry["full_k"] = torch.cat([entry["full_k"], key_states], dim=2)
+            entry["full_v"] = torch.cat([entry["full_v"], value_states], dim=2)
 
         self._maybe_quantize(layer_idx)
 
     def _maybe_quantize(self, layer_idx: int):
-        """Quantize tokens beyond the residual window."""
+        """Quantize tokens that overflowed the residual window.
+
+        Each overflow block is quantized once and *appended* to a chunk list -
+        never overwritten - so streaming updates keep the whole prefix. To
+        avoid degenerate key groups during decode (per-channel groups run
+        along the token axis), tokens accumulate in the FP16 residual until at
+        least ``group_size`` of them have overflowed; the residual can
+        therefore temporarily hold up to ``residual_length + group_size - 1``
+        tokens.
+        """
         entry = self._cache[layer_idx]
-        seq_len = entry["full_k"].size(2)
+        overflow = entry["full_k"].size(2) - self.residual_length
 
-        if seq_len <= self.residual_length:
+        if overflow < self.group_size:
             return
-
-        # Split into quantizable and residual portions
-        quant_len = seq_len - self.residual_length
-        k_to_quant = entry["full_k"][:, :, :quant_len, :]
-        v_to_quant = entry["full_v"][:, :, :quant_len, :]
 
         # Keys: per-channel - group-wise along the token axis (dim=2).
         # Values: per-token - group-wise along the head_dim axis (dim=3).
-        entry["gq_k"] = quantize_grouped(k_to_quant, self.bits, axis=2, group_size=self.group_size)
-        entry["gq_v"] = quantize_grouped(v_to_quant, self.bits, axis=3, group_size=self.group_size)
+        entry["chunks_k"].append(quantize_grouped(
+            entry["full_k"][:, :, :overflow, :], self.bits, axis=2, group_size=self.group_size))
+        entry["chunks_v"].append(quantize_grouped(
+            entry["full_v"][:, :, :overflow, :], self.bits, axis=3, group_size=self.group_size))
 
-        # Keep only residual portion in full precision
-        entry["full_k"] = entry["full_k"][:, :, quant_len:, :]
-        entry["full_v"] = entry["full_v"][:, :, quant_len:, :]
+        # Keep only the residual portion in full precision
+        entry["full_k"] = entry["full_k"][:, :, overflow:, :].contiguous()
+        entry["full_v"] = entry["full_v"][:, :, overflow:, :].contiguous()
 
     def get_kv(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Get full (dequantized + residual) KV states for a layer.
@@ -106,17 +108,10 @@ class KIVIQuantizedKVCache:
         """
         entry = self._cache[layer_idx]
 
-        parts_k = []
-        parts_v = []
-
-        # Dequantize the quantized portion
-        if entry["gq_k"] is not None:
-            parts_k.append(dequantize_grouped(entry["gq_k"]))
-            parts_v.append(dequantize_grouped(entry["gq_v"]))
-
-        # Append residual (FP16) portion
-        parts_k.append(entry["full_k"])
-        parts_v.append(entry["full_v"])
+        parts_k = [dequantize_grouped(gq) for gq in entry["chunks_k"]]
+        parts_v = [dequantize_grouped(gq) for gq in entry["chunks_v"]]
+        parts_k.append(entry["full_k"].float())
+        parts_v.append(entry["full_v"].float())
 
         keys = torch.cat(parts_k, dim=2) if len(parts_k) > 1 else parts_k[0]
         values = torch.cat(parts_v, dim=2) if len(parts_v) > 1 else parts_v[0]
@@ -130,10 +125,9 @@ class KIVIQuantizedKVCache:
         """Total logical memory: packed codes + fp16 scale/zp + fp16 residual."""
         total = 0
         for entry in self._cache.values():
-            # Quantized portion: logical packed size (codes + fp16 scale/zp)
-            if entry["gq_k"] is not None:
-                total += entry["gq_k"].memory_bytes()
-                total += entry["gq_v"].memory_bytes()
+            # Quantized chunks: logical packed size (codes + fp16 scale/zp)
+            for gq in entry["chunks_k"] + entry["chunks_v"]:
+                total += gq.memory_bytes()
             # FP16 residual: 2 bytes/elem (logical FP16, matching other methods)
             total += entry["full_k"].nelement() * 2
             total += entry["full_v"].nelement() * 2
