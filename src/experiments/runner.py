@@ -131,6 +131,7 @@ def run_perplexity_experiment(args):
         seq_len=args.seq_len,
         max_samples=args.max_samples,
         device=args.device,
+        turbo=args.turbo,
     )
     elapsed = time.perf_counter() - start
 
@@ -245,6 +246,8 @@ def main():
     parser.add_argument("--device", default="auto", help="Device (auto, cuda, cpu)")
     parser.add_argument("--seq-len", type=int, default=512, help="Sequence length")
     parser.add_argument("--max-samples", type=int, default=5, help="Max eval samples (for PPL)")
+    parser.add_argument("--turbo", default="off", choices=["off", "rot", "normal", "rot-normal"],
+                        help="TurboQuant hardening for SalienceQuant PPL runs")
     parser.add_argument("--output", "-o", default=None, help="Output directory for results JSON")
 
     # Synthetic data options (no model needed)
