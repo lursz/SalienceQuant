@@ -400,6 +400,24 @@ class TestTurboQuant:
         )
         assert (keys - turbo).pow(2).mean() <= (keys - tiered).pow(2).mean()
 
+    def test_normal_codebook_beats_uniform_on_gaussian_int2(self):
+        """Lloyd-Max levels are MSE-optimal for Gaussian data at low bits."""
+        from src.shared.quantize import quantize_dequantize_grouped
+        torch.manual_seed(0)
+        x = torch.randn(1, 2, 512, 64)
+        uni = quantize_dequantize_grouped(x, 2, axis=2, group_size=128, codebook="uniform")
+        llo = quantize_dequantize_grouped(x, 2, axis=2, group_size=128, codebook="normal")
+        assert (x - llo).pow(2).mean() < (x - uni).pow(2).mean()
+
+    def test_random_rotation_is_orthogonal_and_deterministic(self):
+        from src.salience.turboquant import random_rotation
+        r1 = random_rotation(64, seed=0)
+        r2 = random_rotation(64, seed=0)
+        assert torch.equal(r1, r2)
+        assert torch.allclose(r1 @ r1.T, torch.eye(64), atol=1e-5)
+        x = torch.randn(1, 2, 32, 64)
+        assert torch.allclose((x.float() @ r1.T) @ r1, x, atol=1e-5)
+
     def test_int8_overlay_matches_fp16_overlay_quality(self):
         """INT8 channel storage should be near-lossless vs FP16 restore, and cheaper."""
         from src.salience.tiered import TieredQuantizer, TierConfig, assign_tiers

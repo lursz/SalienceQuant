@@ -1,11 +1,30 @@
-"""TurboQuant outlier-channel protection for Keys.
+"""TurboQuant-style quantizer hardening for the KV cache.
 
-After tiered group-wise quantization, re-stores the top-RMS key channels
-(per head, ~10%) at higher precision. By default the protected channels are
-kept at INT8 (group-wise along the token axis) - for smooth high-RMS channels
-this is near-lossless at half the cost of FP16, which is what makes the
-protection affordable under honest bit accounting. ``overlay_bits=16`` gives
-the original FP16 restore. Values use standard tiered quant only.
+Two mechanisms, both free in bit accounting, following TurboQuant
+(Zandieh et al., 2025, arXiv:2504.19874):
+
+* **Random rotation**: each head-dim vector is rotated by a seeded random
+  orthogonal matrix before quantization (and rotated back after). This spreads
+  outlier-channel energy uniformly, making per-coordinate distributions
+  near-Gaussian - the pathological key channels that break low-bit
+  quantization simply disappear. The matrix is derived from a fixed seed, so
+  it costs zero stored bits.
+* **MSE-optimal codebook**: with near-Gaussian coordinates, groups are
+  standardized and snapped to Lloyd-Max levels for a standard normal instead
+  of a uniform min-max grid (``codebook="normal"`` in shared.quantize).
+  Metadata cost is identical (mean+std vs min+max).
+
+The older outlier-channel overlay (top-RMS channels re-stored at
+``overlay_bits``) is kept for ablation and is off by default
+(``channel_fraction=0``).
+
+Empirical note (Qwen2.5, WikiText-2): both mechanisms LOSE to plain
+group-wise min-max with per-channel (token-axis) key grouping at matched
+bits - the grouping already exploits the channel structure that rotation
+spreads away, and the normal codebook without rotation is catastrophically
+miscalibrated for RoPE'd keys (their per-channel marginals are bimodal, not
+Gaussian). Defaults are therefore ``rotate=False, codebook="uniform"``;
+the options remain for the thesis ablation.
 """
 
 from dataclasses import dataclass
@@ -18,10 +37,32 @@ from src.shared.quantize import quantize_dequantize_grouped
 
 @dataclass
 class TurboQuantConfig:
-    """TurboQuant channel protection settings."""
-    channel_fraction: float = 0.10
+    """TurboQuant quantizer settings (defaults = empirically best: all off)."""
     group_size: int = 64
-    overlay_bits: int = 8  # precision of protected channels; 16 = FP16 restore
+    rotate: bool = False         # random-rotation preprocessing (seeded, zero-cost)
+    codebook: str = "uniform"    # "normal" Lloyd-Max or "uniform" min-max
+    channel_fraction: float = 0.0  # legacy outlier-channel overlay (0 = off)
+    overlay_bits: int = 8        # precision of overlay channels; 16 = FP16 restore
+
+
+_ROTATIONS: dict[tuple, torch.Tensor] = {}
+
+
+def random_rotation(
+    dim: int,
+    seed: int = 0,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Seeded random orthogonal matrix (QR of an i.i.d. Gaussian), cached."""
+    key = (dim, seed, str(device), dtype)
+    if key not in _ROTATIONS:
+        g = torch.Generator().manual_seed(seed)
+        a = torch.randn(dim, dim, generator=g)
+        q, r = torch.linalg.qr(a)
+        q = q * torch.sign(torch.diagonal(r))  # deterministic sign convention
+        _ROTATIONS[key] = q.to(device=device, dtype=dtype)
+    return _ROTATIONS[key]
 
 
 def detect_outlier_channels(
@@ -108,21 +149,30 @@ def apply_turboquant_key_quant(
     protected_mask: torch.Tensor,
     tq_config: TurboQuantConfig | None = None,
 ) -> torch.Tensor:
-    """Tiered key quantization with TurboQuant outlier-channel protection.
+    """Tiered key quantization with TurboQuant quantizer hardening.
 
-    Outlier channels of quantized-tier tokens are replaced with their
-    higher-precision overlay reconstruction; FP16-tier tokens are already
-    stored exactly and never pay for (or get degraded by) the overlay.
+    With ``rotate`` on, tiers are quantized in a randomly rotated basis with
+    the MSE-optimal normal codebook. The legacy outlier-channel overlay (only
+    when ``channel_fraction > 0``) replaces outlier channels of quantized-tier
+    tokens with a higher-precision reconstruction; FP16-tier tokens are stored
+    exactly and never pay for (or get degraded by) the overlay.
     """
     tq = tq_config or TurboQuantConfig()
     device = keys.device
     importance = importance.to(device)
     protected_mask = protected_mask.to(device)
+    rotation = (
+        random_rotation(keys.size(-1), device=device) if tq.rotate else None
+    )
 
     result = apply_tiered_quant(
         keys, importance, config, quant_dim=2,
         protected_mask=protected_mask, group_size=tq.group_size,
+        rotation=rotation, codebook=tq.codebook,
     )
+    if tq.channel_fraction <= 0:
+        return result
+
     outlier_ch = detect_outlier_channels(keys, tq.channel_fraction)
     channel_source = _overlay_channel_source(
         keys, outlier_ch, tq.overlay_bits, tq.group_size

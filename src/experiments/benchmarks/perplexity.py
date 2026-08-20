@@ -9,8 +9,9 @@ quantization (KIVI/KVQuant style). On top of that:
     - KIVI     : per-channel K, per-token V, recent residual window in FP16.
     - Salience : mixed precision - bits allocated per token by importance
                  (attention for V, attention x V-deviation for K), with sinks
-                 and a recent window protected in FP16, plus TurboQuant
-                 outlier-channel FP16 restore on Keys.
+                 and a recent window protected in FP16. Optional TurboQuant
+                 quantizer hardening (rotation / normal codebook / channel
+                 overlay) is available via TurboQuantConfig but off by default.
 
 To compare methods fairly we report *effective* bits/element, which includes
 the fp16 scale + zero-point overhead of group-wise quantization.
@@ -26,7 +27,9 @@ from src.shared.hooks import make_proj_quant_hook, make_residual_proj_hook, DEFA
 from src.shared.quantize import grouped_effective_bits
 from src.salience.tiered import TierConfig, apply_tiered_quant
 from src.salience.scoring.sink_detector import get_protected_mask
-from src.salience.turboquant import TurboQuantConfig, apply_turboquant_key_quant
+from src.salience.turboquant import (
+    TurboQuantConfig, apply_turboquant_key_quant, random_rotation,
+)
 
 
 def _get_kv_config(model: AutoModelForCausalLM) -> tuple[int, int]:
@@ -317,9 +320,14 @@ def _make_salience_proj_hooks(
     def make_v_hook(idx):
         def hook(_m, _a, out):
             x = _reshape_kv_proj(out, num_kv_heads, head_dim)
+            rotation = (
+                random_rotation(head_dim, device=x.device)
+                if turbo_config.rotate else None
+            )
             xq = apply_tiered_quant(
                 x, val_imp[idx], tier_config, quant_dim=-1,
                 protected_mask=protected["mask"], group_size=group_size,
+                rotation=rotation, codebook=turbo_config.codebook,
             )
             return _flatten_kv_proj(xq, num_kv_heads, head_dim)
         return hook
@@ -347,8 +355,8 @@ def evaluate_ppl_with_salience_quant(
     Pass 1 (FP16): derive per-token importance from the window's own attention.
     Pass 2: quantize each token to its tier (group-wise asymmetric) and score loss.
 
-    Keys additionally get TurboQuant outlier-channel FP16 restore; ``turbo_config``
-    defaults to TurboQuantConfig().
+    ``turbo_config`` (default TurboQuantConfig()) controls optional quantizer
+    hardening: rotated-basis quant, normal codebook, and the channel overlay.
     """
     if device is None or device == "auto":
         device = next(model.parameters()).device
@@ -466,16 +474,16 @@ def run_ppl_comparison(
 
     # --- ~3.3 effective bits: the aggressive regime where KIVI hits its cliff.
     #     KIVI cannot fit 3-bit here (needs >=~3.5 eff bits) so it must use 2-bit.
-    #     Salience budgets INCLUDE the TurboQuant INT8 channel overlay and sit
-    #     at or below the KIVI budget they are paired with.
+    #     Salience budgets are fully billed and sit at or below the KIVI budget
+    #     they are paired with.
     print("KIVI 2-bit (~3.3b)...")
     add(evaluate_ppl_with_kivi_quant(model, tokenizer, bits=2, seq_len=seq_len, max_samples=max_samples,
                                      device=device, residual_length=32, group_size=64))
     print("SalienceQuant (~3.3b)...")
     r = evaluate_ppl_with_salience_quant(
         model, tokenizer,
-        tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.0, int3_pct=0.30),
-        turbo_config=TurboQuantConfig(channel_fraction=0.05, group_size=128, overlay_bits=8),
+        tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.0, int3_pct=0.45),
+        turbo_config=TurboQuantConfig(group_size=128),
         seq_len=seq_len, max_samples=max_samples, device=device,
         group_size=128, recent_window=16, input_ids=input_ids,
         method_name="SalienceQuant (~3.3b)",
@@ -489,8 +497,8 @@ def run_ppl_comparison(
     print("SalienceQuant (~3.7b)...")
     r = evaluate_ppl_with_salience_quant(
         model, tokenizer,
-        tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.10, int3_pct=0.55),
-        turbo_config=TurboQuantConfig(channel_fraction=0.05, group_size=128, overlay_bits=8),
+        tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.15, int3_pct=0.55),
+        turbo_config=TurboQuantConfig(group_size=128),
         seq_len=seq_len, max_samples=max_samples, device=device,
         group_size=128, recent_window=16, input_ids=input_ids,
         method_name="SalienceQuant (~3.7b)",

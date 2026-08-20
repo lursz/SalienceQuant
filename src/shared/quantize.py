@@ -51,6 +51,31 @@ def dequantize_symmetric(codes: torch.Tensor, scale: torch.Tensor) -> torch.Tens
 # Group-wise asymmetric quantization (KIVI / KVQuant style)
 # ---------------------------------------------------------------------------
 
+# Lloyd-Max optimal quantizer levels for a standard normal source (Max, 1960).
+# After a random rotation the per-coordinate distribution is near-Gaussian
+# (TurboQuant), so snapping standardized groups to these levels gives lower
+# MSE than uniform min-max at the same bit-width. Metadata cost is identical:
+# mean+std instead of min+max.
+_NORMAL_LEVELS = {
+    1: [-0.7979, 0.7979],
+    2: [-1.5104, -0.4528, 0.4528, 1.5104],
+    3: [-2.1520, -1.3439, -0.7560, -0.2451, 0.2451, 0.7560, 1.3439, 2.1520],
+    4: [-2.7326, -2.0690, -1.6181, -1.2562, -0.9424, -0.6568, -0.3881, -0.1284,
+        0.1284, 0.3881, 0.6568, 0.9424, 1.2562, 1.6181, 2.0690, 2.7326],
+}
+_NORMAL_TABLES: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _normal_tables(bits: int, device, dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """(levels, decision boundaries) for the Lloyd-Max normal codebook."""
+    key = (bits, str(device), dtype)
+    if key not in _NORMAL_TABLES:
+        levels = torch.tensor(_NORMAL_LEVELS[bits], device=device, dtype=dtype)
+        bounds = (levels[1:] + levels[:-1]) / 2
+        _NORMAL_TABLES[key] = (levels, bounds)
+    return _NORMAL_TABLES[key]
+
+
 @dataclass
 class GroupedQuant:
     """A group-wise quantized tensor plus the metadata needed to reverse it.
@@ -60,12 +85,13 @@ class GroupedQuant:
     :func:`dequantize_grouped` reshapes back, drops padding, and restores the axis.
     """
     codes: torch.Tensor          # quantized integers, grouped+padded layout
-    scale: torch.Tensor          # [..., n_groups, 1]
-    zero_point: torch.Tensor | None
+    scale: torch.Tensor          # [..., n_groups, 1]  (std for "normal" codebook)
+    zero_point: torch.Tensor | None   # (mean for "normal" codebook)
     axis: int
     group_size: int
     orig_len: int                # original length along `axis`, before padding
     bits: int
+    codebook: str = "uniform"    # "uniform" min-max grid or "normal" Lloyd-Max
 
     def memory_bytes(self) -> int:
         """Logical packed size: codes at `bits`/elem (unpadded) + scale/zp at 2 B each."""
@@ -84,11 +110,19 @@ def quantize_grouped(
     axis: int,
     group_size: int,
     symmetric: bool = False,
+    codebook: str = "uniform",
 ) -> GroupedQuant:
     """Group-wise quantization along ``axis`` in contiguous groups of ``group_size``.
 
     Each group gets its own scale (and zero-point, unless ``symmetric``). The axis
-    is padded up to a multiple of ``group_size`` so any length is supported.
+    is padded up to a multiple of ``group_size`` so any length is supported;
+    padding replicates the last real value so it cannot stretch the group's range.
+
+    ``codebook="normal"`` standardizes each group by its mean/std and snaps to
+    the Lloyd-Max levels of a standard normal - the MSE-optimal scalar quantizer
+    when coordinates are near-Gaussian (e.g. after a random rotation). Metadata
+    cost is unchanged (mean+std instead of min+max). Falls back to uniform for
+    bit-widths without a level table.
 
     For the KIVI axis convention: Keys group along the token axis (per-channel),
     Values group along the head_dim axis (per-token).
@@ -97,8 +131,18 @@ def quantize_grouped(
     orig_len = x.shape[-1]
     pad = (-orig_len) % group_size
     if pad:
-        x = torch.nn.functional.pad(x, (0, pad))
+        flat = x.reshape(-1, 1, orig_len)
+        flat = torch.nn.functional.pad(flat, (0, pad), mode="replicate")
+        x = flat.reshape(*x.shape[:-1], orig_len + pad)
     groups = x.reshape(*x.shape[:-1], -1, group_size)  # [..., n_groups, group_size]
+
+    if codebook == "normal" and bits in _NORMAL_LEVELS:
+        g = groups.float()
+        mean = g.mean(dim=-1, keepdim=True)
+        std = g.std(dim=-1, keepdim=True).clamp(min=1e-8)
+        levels, bounds = _normal_tables(bits, g.device, torch.float32)
+        codes = torch.bucketize(((g - mean) / std).contiguous(), bounds).to(torch.int16)
+        return GroupedQuant(codes, std, mean, axis, group_size, orig_len, bits, "normal")
 
     if symmetric:
         qmax = (1 << (bits - 1)) - 1
@@ -118,8 +162,12 @@ def quantize_grouped(
 
 def dequantize_grouped(gq: GroupedQuant) -> torch.Tensor:
     """Inverse of :func:`quantize_grouped`, restoring the original shape."""
-    codes = gq.codes.float()
-    deq = codes * gq.scale if gq.zero_point is None else (codes - gq.zero_point) * gq.scale
+    if gq.codebook == "normal":
+        levels, _ = _normal_tables(gq.bits, gq.codes.device, torch.float32)
+        deq = levels[gq.codes.long()] * gq.scale + gq.zero_point
+    else:
+        codes = gq.codes.float()
+        deq = codes * gq.scale if gq.zero_point is None else (codes - gq.zero_point) * gq.scale
     deq = deq.reshape(*deq.shape[:-2], -1)[..., :gq.orig_len]  # collapse groups, drop padding
     return deq.movedim(-1, gq.axis)
 
@@ -130,9 +178,10 @@ def quantize_dequantize_grouped(
     axis: int,
     group_size: int,
     symmetric: bool = False,
+    codebook: str = "uniform",
 ) -> torch.Tensor:
     """Group-wise quantize then immediately dequantize (for simulation hooks)."""
-    gq = quantize_grouped(tensor, bits, axis, group_size, symmetric)
+    gq = quantize_grouped(tensor, bits, axis, group_size, symmetric, codebook)
     return dequantize_grouped(gq).to(tensor.dtype)
 
 

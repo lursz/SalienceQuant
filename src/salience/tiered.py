@@ -132,8 +132,15 @@ class TieredQuantizer:
     Supports separate tier assignments for Keys and Values (asymmetric scoring).
     """
 
-    def __init__(self, group_size: int = 64):
+    def __init__(
+        self,
+        group_size: int = 64,
+        codebook: str = "uniform",
+        rotation: torch.Tensor | None = None,
+    ):
         self.group_size = group_size
+        self.codebook = codebook
+        self.rotation = rotation  # optional TurboQuant-style rotated-basis quant
         # Per-tier storage: tier -> (GroupedQuant,) for quantized tiers, (raw,) for FP16
         self._key_tiers: dict[Tier, tuple] = {}
         self._value_tiers: dict[Tier, tuple] = {}
@@ -235,8 +242,11 @@ class TieredQuantizer:
             else:
                 if fisher_scale is not None:
                     chunk = chunk * fisher_scale.unsqueeze(0).unsqueeze(2)  # [1, heads, 1, head_dim]
+                if self.rotation is not None:
+                    chunk = chunk.float() @ self.rotation.T
                 tiers[tier] = (quantize_grouped(
-                    chunk, TIER_BITS[tier], axis=axis, group_size=self.group_size),)
+                    chunk, TIER_BITS[tier], axis=axis, group_size=self.group_size,
+                    codebook=self.codebook),)
         return tiers, indices
 
     def dequantize(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -248,8 +258,10 @@ class TieredQuantizer:
         keys = torch.zeros(batch, heads, self._seq_len, head_dim,
                            device=self._device, dtype=torch.float)
         values = torch.zeros_like(keys)
-        self._restore_side(keys, self._key_tiers, self._key_tier_indices, self._key_fisher_scale)
-        self._restore_side(values, self._value_tiers, self._value_tier_indices, self._value_fisher_scale)
+        self._restore_side(keys, self._key_tiers, self._key_tier_indices,
+                           self._key_fisher_scale, self.rotation)
+        self._restore_side(values, self._value_tiers, self._value_tier_indices,
+                           self._value_fisher_scale, self.rotation)
         if self._key_outlier_overlay is not None:
             keys = self._apply_key_overlay(keys)
         return keys, values
@@ -277,6 +289,7 @@ class TieredQuantizer:
         tiers: dict,
         indices: dict,
         fisher_scale: torch.Tensor | None,
+        rotation: torch.Tensor | None = None,
     ):
         """Scatter each tier's dequantized tokens back into `out` (in place)."""
         for tier, idx in indices.items():
@@ -284,6 +297,8 @@ class TieredQuantizer:
                 deq = tiers[tier][0].float()
             else:
                 deq = dequantize_grouped(tiers[tier][0])
+                if rotation is not None:  # back to the original basis
+                    deq = deq @ rotation.to(deq.device)
                 if fisher_scale is not None:  # reverse the sqrt(Fisher) pre-scaling
                     deq = deq / fisher_scale.unsqueeze(0).unsqueeze(2).to(deq.device)
             out[:, :, idx, :] = deq
@@ -356,6 +371,8 @@ def apply_tiered_quant(
     quant_dim: int,
     protected_mask: torch.Tensor | None = None,
     group_size: int = 64,
+    rotation: torch.Tensor | None = None,
+    codebook: str = "uniform",
 ) -> torch.Tensor:
     """Apply tiered group-wise quantization to a KV tensor by per-token importance.
 
@@ -372,6 +389,10 @@ def apply_tiered_quant(
             -1 -> per-token  (for Values, group along head_dim axis)
         protected_mask: [seq_len] bool, True = always FP16 (sinks + recent).
         group_size: Quantization group size.
+        rotation: Optional [head_dim, head_dim] orthogonal matrix. Tiers are
+            quantized in the rotated basis and rotated back (TurboQuant-style
+            outlier spreading; costs no stored bits when seed-derived).
+        codebook: Per-group codebook for quantized tiers ("uniform"/"normal").
 
     Returns:
         Tensor with same shape, quantized per-tier.
@@ -394,9 +415,16 @@ def apply_tiered_quant(
         idx = ranked[tier_of == int(tier)]
         if idx.numel() == 0:
             continue
-        result[:, :, idx, :] = quantize_dequantize_grouped(
-            tensor[:, :, idx, :], bits=TIER_BITS[tier],
+        chunk = tensor[:, :, idx, :]
+        if rotation is not None:
+            chunk = chunk.float() @ rotation.T
+        deq = quantize_dequantize_grouped(
+            chunk, bits=TIER_BITS[tier],
             axis=quant_dim, group_size=group_size, symmetric=False,
-        ).to(tensor.dtype)
+            codebook=codebook,
+        )
+        if rotation is not None:
+            deq = deq @ rotation
+        result[:, :, idx, :] = deq.to(tensor.dtype)
 
     return result
