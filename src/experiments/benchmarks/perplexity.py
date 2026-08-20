@@ -81,23 +81,35 @@ def _kivi_eff_bits(
 
 
 def _salience_eff_bits(
-    config: TierConfig, protected_frac: float, group_size: int, head_dim: int
+    config: TierConfig,
+    protected_frac: float,
+    group_size: int,
+    head_dim: int,
+    turbo_channel_frac: float = 0.0,
 ) -> tuple[float, float]:
     """Effective bits/element for the tiered scheme, returned as (key, value).
 
     Protected tokens (sinks + recent) are FP16. The rest are split across tiers
     (group-wise asymmetric), and we include the scale+zp overhead per tier.
+
+    ``turbo_channel_frac`` is the fraction of key channels the TurboQuant
+    overlay restores to FP16: those channels cost 16 bits (and carry no
+    scale/zp overhead) regardless of the token's tier.
     """
     from src.salience.tiered import TIER_BITS
 
-    def avg(eff_fn):
+    def avg(eff_fn, overlay_frac=0.0):
+        def per_elem(bits):
+            if bits == 16:
+                return 16.0
+            return overlay_frac * 16 + (1 - overlay_frac) * eff_fn(bits)
+
         non_protected = sum(
-            frac * (16 if TIER_BITS[tier] == 16 else eff_fn(TIER_BITS[tier]))
-            for frac, tier in config.tiers()
+            frac * per_elem(TIER_BITS[tier]) for frac, tier in config.tiers()
         )
         return protected_frac * 16 + (1 - protected_frac) * non_protected
 
-    k = avg(lambda b: _key_eff_bits(b, group_size))
+    k = avg(lambda b: _key_eff_bits(b, group_size), overlay_frac=turbo_channel_frac)
     v = avg(lambda b: _val_eff_bits(b, group_size, head_dim))
     return k, v
 
@@ -393,7 +405,10 @@ def evaluate_ppl_with_salience_quant(
 
     avg_loss = total_loss / total_tokens
     protected_frac = min(num_sink_tokens + recent_window, seq_len) / seq_len
-    k_eff, v_eff = _salience_eff_bits(config, protected_frac, quant_group_size, head_dim)
+    k_eff, v_eff = _salience_eff_bits(
+        config, protected_frac, quant_group_size, head_dim,
+        turbo_channel_frac=turbo_config.channel_fraction,
+    )
     return {
         "perplexity": torch.exp(torch.tensor(avg_loss)).item(),
         "loss": avg_loss,

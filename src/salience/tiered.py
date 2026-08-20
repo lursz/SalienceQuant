@@ -263,20 +263,34 @@ class TieredQuantizer:
         FP16 tier reports 2 bytes/elem (the tier's intended precision, regardless
         of the actual PyTorch dtype which may be float32 during testing).
         Scale tensors report actual size.
+
+        Key channels restored to FP16 by the TurboQuant overlay are charged at
+        2 bytes/elem instead of their tier's packed size - they must be stored
+        in full precision, so billing them at tier bits would overstate the
+        compression ratio.
         """
         result = {}
         total = 0
         for tier in Tier:
             tier_bytes = 0
-            for storage in [self._key_tiers, self._value_tiers]:
-                if tier in storage:
-                    data = storage[tier]
-                    if tier == Tier.FP16:
-                        # FP16: 2 bytes/element (logical FP16 size)
-                        tier_bytes += data[0].nelement() * 2
-                    else:
-                        # Quantized: GroupedQuant (codes + fp16 scale/zp)
-                        tier_bytes += data[0].memory_bytes()
+            for side, storage in (("key", self._key_tiers), ("value", self._value_tiers)):
+                if tier not in storage:
+                    continue
+                data = storage[tier]
+                if tier == Tier.FP16:
+                    # FP16: 2 bytes/element (logical FP16 size)
+                    tier_bytes += data[0].nelement() * 2
+                else:
+                    # Quantized: GroupedQuant (codes + fp16 scale/zp)
+                    side_bytes = data[0].memory_bytes()
+                    if side == "key" and self._key_outlier_overlay is not None:
+                        mask, _ = self._key_outlier_overlay
+                        batch = self._shape[0]
+                        n_tokens = self._key_tier_indices[tier].numel()
+                        outlier_elems = batch * n_tokens * int(mask.sum())
+                        # re-bill overlay elements: FP16 instead of tier bits
+                        side_bytes += int(outlier_elems * (2 - TIER_BITS[tier] / 8))
+                    tier_bytes += side_bytes
             result[tier.name] = tier_bytes
             total += tier_bytes
         result["total"] = total
