@@ -217,9 +217,11 @@ class SalienceCache:
         key_tiers = assign_tiers(key_imp, protected, tier_config)
         val_tiers = assign_tiers(val_imp, protected, tier_config)
 
-        # TurboQuant: restore top-RMS key channels to FP16 on dequantize.
+        # TurboQuant: protect top-RMS key channels (INT8 overlay by default;
+        # overlay_bits=16 keeps them as a raw FP16 copy)
+        overlay_bits = self.turbo_config.overlay_bits
         mask = detect_outlier_channels(keys, self.turbo_config.channel_fraction)
-        key_overlay = (mask, keys.clone())
+        key_overlay = (mask, keys.clone() if overlay_bits >= 16 else keys)
 
         quantizer = TieredQuantizer(group_size=self.turbo_config.group_size)
         quantizer.quantize_and_store(
@@ -227,6 +229,7 @@ class SalienceCache:
             key_fisher_weights=key_fisher_weights,
             value_fisher_weights=val_fisher_weights,
             key_outlier_overlay=key_overlay,
+            key_overlay_bits=overlay_bits,
         )
         self._quantizers[layer_idx] = quantizer
         self._is_quantized[layer_idx] = True

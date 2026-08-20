@@ -86,6 +86,7 @@ def _salience_eff_bits(
     group_size: int,
     head_dim: int,
     turbo_channel_frac: float = 0.0,
+    turbo_overlay_bits: int = 16,
 ) -> tuple[float, float]:
     """Effective bits/element for the tiered scheme, returned as (key, value).
 
@@ -93,16 +94,25 @@ def _salience_eff_bits(
     (group-wise asymmetric), and we include the scale+zp overhead per tier.
 
     ``turbo_channel_frac`` is the fraction of key channels the TurboQuant
-    overlay restores to FP16: those channels cost 16 bits (and carry no
-    scale/zp overhead) regardless of the token's tier.
+    overlay protects: those channels cost the overlay's own effective bits
+    (16 for FP16 restore, grouped INT cost otherwise) regardless of the
+    token's tier. FP16-tier tokens never pay the overlay.
     """
     from src.salience.tiered import TIER_BITS
+
+    overlay_cost = (
+        16.0 if turbo_overlay_bits >= 16
+        else _key_eff_bits(turbo_overlay_bits, group_size)
+    )
+    if turbo_channel_frac > 0:
+        # detect_outlier_channels rounds to whole channels per head
+        turbo_channel_frac = max(1, int(head_dim * turbo_channel_frac)) / head_dim
 
     def avg(eff_fn, overlay_frac=0.0):
         def per_elem(bits):
             if bits == 16:
                 return 16.0
-            return overlay_frac * 16 + (1 - overlay_frac) * eff_fn(bits)
+            return overlay_frac * overlay_cost + (1 - overlay_frac) * eff_fn(bits)
 
         non_protected = sum(
             frac * per_elem(TIER_BITS[tier]) for frac, tier in config.tiers()
@@ -408,6 +418,7 @@ def evaluate_ppl_with_salience_quant(
     k_eff, v_eff = _salience_eff_bits(
         config, protected_frac, quant_group_size, head_dim,
         turbo_channel_frac=turbo_config.channel_fraction,
+        turbo_overlay_bits=turbo_config.overlay_bits,
     )
     return {
         "perplexity": torch.exp(torch.tensor(avg_loss)).item(),
@@ -455,14 +466,16 @@ def run_ppl_comparison(
 
     # --- ~3.3 effective bits: the aggressive regime where KIVI hits its cliff.
     #     KIVI cannot fit 3-bit here (needs >=~3.5 eff bits) so it must use 2-bit.
+    #     Salience budgets INCLUDE the TurboQuant INT8 channel overlay and sit
+    #     at or below the KIVI budget they are paired with.
     print("KIVI 2-bit (~3.3b)...")
     add(evaluate_ppl_with_kivi_quant(model, tokenizer, bits=2, seq_len=seq_len, max_samples=max_samples,
                                      device=device, residual_length=32, group_size=64))
     print("SalienceQuant (~3.3b)...")
     r = evaluate_ppl_with_salience_quant(
         model, tokenizer,
-        tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.05, int3_pct=0.35),
-        turbo_config=TurboQuantConfig(group_size=128),
+        tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.0, int3_pct=0.30),
+        turbo_config=TurboQuantConfig(channel_fraction=0.05, group_size=128, overlay_bits=8),
         seq_len=seq_len, max_samples=max_samples, device=device,
         group_size=128, recent_window=16, input_ids=input_ids,
         method_name="SalienceQuant (~3.3b)",
@@ -476,8 +489,8 @@ def run_ppl_comparison(
     print("SalienceQuant (~3.7b)...")
     r = evaluate_ppl_with_salience_quant(
         model, tokenizer,
-        tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.15, int3_pct=0.55),
-        turbo_config=TurboQuantConfig(group_size=128),
+        tier_config=TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.10, int3_pct=0.55),
+        turbo_config=TurboQuantConfig(channel_fraction=0.05, group_size=128, overlay_bits=8),
         seq_len=seq_len, max_samples=max_samples, device=device,
         group_size=128, recent_window=16, input_ids=input_ids,
         method_name="SalienceQuant (~3.7b)",

@@ -145,8 +145,11 @@ class TieredQuantizer:
         # Fisher scale factors for dequantization (SmoothQuant-style)
         self._key_fisher_scale: torch.Tensor | None = None
         self._value_fisher_scale: torch.Tensor | None = None
-        # TurboQuant: FP16 overlay for outlier key channels (mask, source keys)
-        self._key_outlier_overlay: tuple[torch.Tensor, torch.Tensor] | None = None
+        # TurboQuant overlay for outlier key channels:
+        #   (mask, source) with overlay_bits=16 (FP16 restore), or
+        #   (mask, GroupedQuant) with overlay_bits<16 (INT storage)
+        self._key_outlier_overlay: tuple | None = None
+        self._key_overlay_bits: int = 16
 
     def quantize_and_store(
         self,
@@ -157,6 +160,7 @@ class TieredQuantizer:
         key_fisher_weights: torch.Tensor | None = None,
         value_fisher_weights: torch.Tensor | None = None,
         key_outlier_overlay: tuple[torch.Tensor, torch.Tensor] | None = None,
+        key_overlay_bits: int = 16,
     ):
         """Quantize and store KV states according to tier assignments.
 
@@ -171,8 +175,13 @@ class TieredQuantizer:
                 Fisher get more of the quantization range, reducing their error.
             value_fisher_weights: [num_kv_heads, head_dim] Fisher weights for values.
             key_outlier_overlay: Optional ``(outlier_mask, source_keys)`` for
-                TurboQuant channel restore on dequantize. ``outlier_mask`` is
-                ``[heads, head_dim]`` bool; ``source_keys`` is the pre-quant FP16 keys.
+                TurboQuant channel protection on dequantize. ``outlier_mask`` is
+                ``[heads, head_dim]`` bool with equal count per head;
+                ``source_keys`` is the pre-quant FP16 keys.
+            key_overlay_bits: Precision of the protected channels. 16 keeps a
+                raw FP16 copy; lower values store them as a group-wise INT
+                quantization along the token axis (near-lossless at 8 bits,
+                much cheaper than FP16).
         """
         if value_tier_assignments is None:
             value_tier_assignments = key_tier_assignments
@@ -185,7 +194,15 @@ class TieredQuantizer:
         # and reversed after, giving high-Fisher channels more of the range.
         self._key_fisher_scale = self._fisher_scale(key_fisher_weights)
         self._value_fisher_scale = self._fisher_scale(value_fisher_weights)
-        self._key_outlier_overlay = key_outlier_overlay
+        self._key_overlay_bits = key_overlay_bits
+        if key_outlier_overlay is None or key_overlay_bits >= 16:
+            self._key_outlier_overlay = key_outlier_overlay
+        else:
+            from src.salience.turboquant import gather_outlier_channels
+            mask, source = key_outlier_overlay
+            gathered = gather_outlier_channels(source, mask)
+            self._key_outlier_overlay = (mask, quantize_grouped(
+                gathered, key_overlay_bits, axis=2, group_size=self.group_size))
 
         # Keys group along the token axis (per-channel); Values along head_dim (per-token).
         self._key_tiers, self._key_tier_indices = self._store_side(
@@ -234,10 +251,25 @@ class TieredQuantizer:
         self._restore_side(keys, self._key_tiers, self._key_tier_indices, self._key_fisher_scale)
         self._restore_side(values, self._value_tiers, self._value_tier_indices, self._value_fisher_scale)
         if self._key_outlier_overlay is not None:
-            from src.salience.turboquant import apply_outlier_channel_overlay
-            mask, source = self._key_outlier_overlay
-            keys = apply_outlier_channel_overlay(keys, source.float(), mask)
+            keys = self._apply_key_overlay(keys)
         return keys, values
+
+    def _apply_key_overlay(self, keys: torch.Tensor) -> torch.Tensor:
+        """Overlay protected channels onto quantized-tier tokens (FP16 tokens are exact already)."""
+        from src.salience.turboquant import (
+            apply_outlier_channel_overlay, scatter_outlier_channels,
+        )
+        mask, stored = self._key_outlier_overlay
+        if self._key_overlay_bits >= 16:
+            source = stored.float()
+        else:
+            source = scatter_outlier_channels(
+                torch.zeros_like(keys), dequantize_grouped(stored), mask)
+        token_mask = torch.zeros(self._seq_len, dtype=torch.bool, device=keys.device)
+        for tier, idx in self._key_tier_indices.items():
+            if tier != Tier.FP16:
+                token_mask[idx] = True
+        return apply_outlier_channel_overlay(keys, source, mask.to(keys.device), token_mask)
 
     @staticmethod
     def _restore_side(
@@ -264,13 +296,21 @@ class TieredQuantizer:
         of the actual PyTorch dtype which may be float32 during testing).
         Scale tensors report actual size.
 
-        Key channels restored to FP16 by the TurboQuant overlay are charged at
-        2 bytes/elem instead of their tier's packed size - they must be stored
-        in full precision, so billing them at tier bits would overstate the
-        compression ratio.
+        TurboQuant-protected key channels are charged at the overlay's own
+        precision instead of their tier's packed size - a real layout would not
+        store tier codes for channels the overlay replaces, and billing the
+        overlay at tier bits would overstate the compression ratio. With
+        ``overlay_bits=16`` this means 2 bytes/elem; with INT overlay bits the
+        overlay's actual GroupedQuant size is reported under ``KEY_OVERLAY``.
         """
         result = {}
         total = 0
+        overlay = self._key_outlier_overlay
+        overlay_channel_frac = 0.0
+        if overlay is not None and self._key_overlay_bits < 16:
+            mask = overlay[0]
+            overlay_channel_frac = int(mask.sum()) / mask.numel()
+
         for tier in Tier:
             tier_bytes = 0
             for side, storage in (("key", self._key_tiers), ("value", self._value_tiers)):
@@ -283,16 +323,28 @@ class TieredQuantizer:
                 else:
                     # Quantized: GroupedQuant (codes + fp16 scale/zp)
                     side_bytes = data[0].memory_bytes()
-                    if side == "key" and self._key_outlier_overlay is not None:
-                        mask, _ = self._key_outlier_overlay
-                        batch = self._shape[0]
-                        n_tokens = self._key_tier_indices[tier].numel()
-                        outlier_elems = batch * n_tokens * int(mask.sum())
-                        # re-bill overlay elements: FP16 instead of tier bits
-                        side_bytes += int(outlier_elems * (2 - TIER_BITS[tier] / 8))
+                    if side == "key" and overlay is not None:
+                        if self._key_overlay_bits >= 16:
+                            # FP16 restore: re-bill overlay elements at 2 bytes
+                            mask = overlay[0]
+                            batch = self._shape[0]
+                            n_tokens = self._key_tier_indices[tier].numel()
+                            outlier_elems = batch * n_tokens * int(mask.sum())
+                            side_bytes += int(outlier_elems * (2 - TIER_BITS[tier] / 8))
+                        else:
+                            # INT overlay replaces those channels entirely; keys
+                            # group along the token axis, so codes AND scales
+                            # shrink proportionally with the dropped channels
+                            side_bytes = int(side_bytes * (1 - overlay_channel_frac))
                     tier_bytes += side_bytes
             result[tier.name] = tier_bytes
             total += tier_bytes
+
+        if overlay is not None and self._key_overlay_bits < 16:
+            overlay_bytes = overlay[1].memory_bytes()
+            result["KEY_OVERLAY"] = overlay_bytes
+            total += overlay_bytes
+
         result["total"] = total
         return result
 
