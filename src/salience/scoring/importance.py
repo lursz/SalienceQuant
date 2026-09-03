@@ -1,4 +1,4 @@
-"""Hybrid importance scoring: attention-based for Values, Fisher+V-deviation for Keys.
+"""Hybrid importance scoring: attention-based for Values, V-deviation for Keys.
 
 This is the core novel contribution of SalienceQuant.
 

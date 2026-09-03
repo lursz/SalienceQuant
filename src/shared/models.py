@@ -33,6 +33,8 @@ def load_model(
     if dtype is None:
         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
             dtype = torch.bfloat16
+        elif torch.backends.mps.is_available():
+            dtype = torch.bfloat16
         else:
             dtype = torch.float16
 

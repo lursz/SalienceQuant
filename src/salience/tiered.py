@@ -149,9 +149,6 @@ class TieredQuantizer:
         self._seq_len: int = 0
         self._shape: tuple | None = None   # (batch, heads, head_dim)
         self._device: torch.device | None = None
-        # Fisher scale factors for dequantization (SmoothQuant-style)
-        self._key_fisher_scale: torch.Tensor | None = None
-        self._value_fisher_scale: torch.Tensor | None = None
         # TurboQuant overlay for outlier key channels:
         #   (mask, source) with overlay_bits=16 (FP16 restore), or
         #   (mask, GroupedQuant) with overlay_bits<16 (INT storage)
@@ -164,8 +161,6 @@ class TieredQuantizer:
         values: torch.Tensor,
         key_tier_assignments: torch.Tensor,
         value_tier_assignments: torch.Tensor | None = None,
-        key_fisher_weights: torch.Tensor | None = None,
-        value_fisher_weights: torch.Tensor | None = None,
         key_outlier_overlay: tuple[torch.Tensor, torch.Tensor] | None = None,
         key_overlay_bits: int = 16,
     ):
@@ -177,10 +172,6 @@ class TieredQuantizer:
             key_tier_assignments: [seq_len] tensor of Tier values for keys.
             value_tier_assignments: [seq_len] tensor of Tier values for values.
                 If None, uses key_tier_assignments for both (legacy behaviour).
-            key_fisher_weights: [num_kv_heads, head_dim] per-channel Fisher weights.
-                If provided, uses SmoothQuant-style scaling: channels with higher
-                Fisher get more of the quantization range, reducing their error.
-            value_fisher_weights: [num_kv_heads, head_dim] Fisher weights for values.
             key_outlier_overlay: Optional ``(outlier_mask, source_keys)`` for
                 TurboQuant channel protection on dequantize. ``outlier_mask`` is
                 ``[heads, head_dim]`` bool with equal count per head;
@@ -196,11 +187,6 @@ class TieredQuantizer:
         self._seq_len = keys.size(2)
         self._shape = (keys.size(0), keys.size(1), keys.size(3))
         self._device = keys.device
-
-        # Fisher scale (SmoothQuant-style): sqrt(fisher) applied before quantization
-        # and reversed after, giving high-Fisher channels more of the range.
-        self._key_fisher_scale = self._fisher_scale(key_fisher_weights)
-        self._value_fisher_scale = self._fisher_scale(value_fisher_weights)
         self._key_overlay_bits = key_overlay_bits
         if key_outlier_overlay is None or key_overlay_bits >= 16:
             self._key_outlier_overlay = key_outlier_overlay
@@ -213,20 +199,15 @@ class TieredQuantizer:
 
         # Keys group along the token axis (per-channel); Values along head_dim (per-token).
         self._key_tiers, self._key_tier_indices = self._store_side(
-            keys, key_tier_assignments, axis=2, fisher_scale=self._key_fisher_scale)
+            keys, key_tier_assignments, axis=2)
         self._value_tiers, self._value_tier_indices = self._store_side(
-            values, value_tier_assignments, axis=3, fisher_scale=self._value_fisher_scale)
-
-    @staticmethod
-    def _fisher_scale(weights: torch.Tensor | None) -> torch.Tensor | None:
-        return None if weights is None else (weights + 1e-8).sqrt()
+            values, value_tier_assignments, axis=3)
 
     def _store_side(
         self,
         tensor: torch.Tensor,
         tier_assignments: torch.Tensor,
         axis: int,
-        fisher_scale: torch.Tensor | None,
     ) -> tuple[dict, dict]:
         """Split `tensor`'s tokens by tier and quantize each (FP16 kept raw)."""
         tiers: dict[Tier, tuple] = {}
@@ -240,8 +221,6 @@ class TieredQuantizer:
             if tier == Tier.FP16:
                 tiers[tier] = (chunk,)
             else:
-                if fisher_scale is not None:
-                    chunk = chunk * fisher_scale.unsqueeze(0).unsqueeze(2)  # [1, heads, 1, head_dim]
                 if self.rotation is not None:
                     chunk = chunk.float() @ self.rotation.T
                 tiers[tier] = (quantize_grouped(
@@ -259,9 +238,9 @@ class TieredQuantizer:
                            device=self._device, dtype=torch.float)
         values = torch.zeros_like(keys)
         self._restore_side(keys, self._key_tiers, self._key_tier_indices,
-                           self._key_fisher_scale, self.rotation)
+                           self.rotation)
         self._restore_side(values, self._value_tiers, self._value_tier_indices,
-                           self._value_fisher_scale, self.rotation)
+                           self.rotation)
         if self._key_outlier_overlay is not None:
             keys = self._apply_key_overlay(keys)
         return keys, values
@@ -288,7 +267,6 @@ class TieredQuantizer:
         out: torch.Tensor,
         tiers: dict,
         indices: dict,
-        fisher_scale: torch.Tensor | None,
         rotation: torch.Tensor | None = None,
     ):
         """Scatter each tier's dequantized tokens back into `out` (in place)."""
@@ -299,8 +277,6 @@ class TieredQuantizer:
                 deq = dequantize_grouped(tiers[tier][0])
                 if rotation is not None:  # back to the original basis
                     deq = deq @ rotation.to(deq.device)
-                if fisher_scale is not None:  # reverse the sqrt(Fisher) pre-scaling
-                    deq = deq / fisher_scale.unsqueeze(0).unsqueeze(2).to(deq.device)
             out[:, :, idx, :] = deq
 
     def memory_bytes(self) -> dict[str, int]:

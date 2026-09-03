@@ -11,7 +11,6 @@ Combines all components:
 import torch
 
 from src.salience.scoring.importance import ImportanceScorer
-from src.salience.scoring.fisher import FisherChannelWeights
 from src.salience.scoring.sink_detector import get_protected_mask
 from src.salience.tiered import TieredQuantizer, TierConfig, assign_tiers
 from src.salience.turboquant import (
@@ -47,7 +46,6 @@ class SalienceCache:
         rescore_interval: int = 16,
         tier_config: TierConfig | None = None,
         per_layer_tier_configs: dict[int, TierConfig] | None = None,
-        fisher_weights: FisherChannelWeights | None = None,
         turbo_config: TurboQuantConfig | None = None,
     ):
         """
@@ -62,8 +60,6 @@ class SalienceCache:
             tier_config: Default tier percentages (used when per_layer not set).
             per_layer_tier_configs: Per-layer tier configs from budget optimizer.
                 Overrides tier_config for layers that have an entry.
-            fisher_weights: Offline Fisher channel weights. If provided,
-                used to weight importance scores by channel sensitivity.
             turbo_config: Optional TurboQuant quantizer hardening (rotated-basis
                 quant, normal codebook, outlier-channel overlay). Defaults to
                 TurboQuantConfig(), which disables all three.
@@ -76,7 +72,6 @@ class SalienceCache:
         self.rescore_interval = rescore_interval
         self.tier_config = tier_config or TierConfig()
         self.per_layer_tier_configs = per_layer_tier_configs or {}
-        self.fisher_weights = fisher_weights
         self.turbo_config = turbo_config or TurboQuantConfig()
 
         self.scorer = ImportanceScorer(num_layers, num_kv_heads, alpha)
@@ -203,13 +198,6 @@ class SalienceCache:
         key_imp = key_imp[:seq_len]
         val_imp = val_imp[:seq_len]
 
-        # Get Fisher channel weights if available (passed to quantizer for per-channel scaling)
-        key_fisher_weights = None
-        val_fisher_weights = None
-        if self.fisher_weights is not None:
-            key_fisher_weights = self.fisher_weights.get_channel_weights(layer_idx, "key")
-            val_fisher_weights = self.fisher_weights.get_channel_weights(layer_idx, "value")
-
         # Protected mask
         protected = get_protected_mask(
             seq_len, self.num_sink_tokens, self.recent_window, device
@@ -236,8 +224,6 @@ class SalienceCache:
         )
         quantizer.quantize_and_store(
             keys, values, key_tiers, val_tiers,
-            key_fisher_weights=key_fisher_weights,
-            value_fisher_weights=val_fisher_weights,
             key_outlier_overlay=key_overlay,
             key_overlay_bits=tq.overlay_bits,
         )
