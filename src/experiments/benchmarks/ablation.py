@@ -8,7 +8,6 @@ Components ablated (in order):
     5. +EMA decay: exponential decay on attention scores
     6. +V-deviation: use Key importance metric (attention × V-deviation) for Keys
     7. +Per-layer budget: different tier configs per layer based on sensitivity
-    8. +Fisher channel weights: offline Fisher prior for channel importance
 """
 
 import torch
@@ -89,7 +88,6 @@ def run_ablation(
     states: CapturedStates,
     num_kv_heads: int,
     num_attention_heads: int,
-    fisher_weights=None,
     per_layer_tier_configs: dict | None = None,
 ) -> list[AblationResult]:
     """Run the full ablation study.
@@ -98,7 +96,6 @@ def run_ablation(
         states: Captured model states.
         num_kv_heads: Number of KV heads.
         num_attention_heads: Number of Q heads.
-        fisher_weights: Optional Fisher channel weights.
         per_layer_tier_configs: Optional per-layer tier configs.
 
     Returns:
@@ -241,7 +238,7 @@ def run_ablation(
     )
     results.append(AblationResult("+EMA decay", ["uniform", "attention", "multi-tier", "sinks", "ema"], metrics))
 
-    # ---- Ablation 6: +V-deviation (Key Fisher) ----
+    # ---- Ablation 6: +V-deviation ----
     # Value importance streamed like row 5 (cumulative ablation); the
     # V-deviation key metric is computed once on the full window, as in
     # SalienceCache's periodic re-scoring.
@@ -322,46 +319,6 @@ def run_ablation(
         results.append(AblationResult(
             "+Per-layer budget",
             ["uniform", "attention", "multi-tier", "sinks", "ema", "v-deviation", "budget"],
-            metrics,
-        ))
-
-    # ---- Ablation 8: +Fisher channel weights (if provided) ----
-    if fisher_weights is not None:
-        approx_k_list, approx_v_list, total_mem = [], [], 0
-        for layer_idx in sorted(states.keys.keys()):
-            k = states.keys[layer_idx]
-            v = states.values[layer_idx]
-            seq_len = k.size(2)
-
-            key_imp = scorer.get_key_importance(layer_idx)
-            val_imp = scorer.get_value_importance(layer_idx)
-            key_imp = _pad_or_trim(key_imp, seq_len)
-            val_imp = _pad_or_trim(val_imp, seq_len)
-
-            # Scale by Fisher
-            key_scale = fisher_weights.get_channel_weights(layer_idx, "key").mean().item()
-            val_scale = fisher_weights.get_channel_weights(layer_idx, "value").mean().item()
-            key_imp = key_imp * key_scale
-            val_imp = val_imp * val_scale
-            combined = torch.max(key_imp, val_imp)
-
-            layer_config = per_layer_tier_configs.get(layer_idx, default_config) if per_layer_tier_configs else default_config
-            protected = get_protected_mask(seq_len, num_sink_tokens=4, recent_window=0, device=k.device)
-            k_hat, v_hat, mem = _tiered_quantize_kv(
-                k, v, combined, protected, layer_config
-            )
-            approx_k_list.append(k_hat)
-            approx_v_list.append(v_hat)
-            total_mem += mem
-
-        metrics = compute_reconstruction_metrics(
-            ref_k_cat, ref_v_cat,
-            torch.cat(approx_k_list, dim=2), torch.cat(approx_v_list, dim=2),
-            total_mem,
-        )
-        results.append(AblationResult(
-            "+Fisher weights",
-            ["uniform", "attention", "multi-tier", "sinks", "ema", "v-deviation", "budget", "fisher"],
             metrics,
         ))
 

@@ -134,7 +134,6 @@ def eval_salience(
     tier_config: TierConfig | None = None,
     rescore_interval: int = 1,
     use_v_deviation: bool = True,
-    fisher_weights=None,
     per_layer_tier_configs=None,
     turbo_config: TurboQuantConfig | None = None,
     name: str | None = None,
@@ -149,7 +148,6 @@ def eval_salience(
         rescore_interval: Re-quantize every N layers processed.
         use_v_deviation: If True, use V-deviation for Key importance.
             If False, use attention-only (for ablation).
-        fisher_weights: Optional Fisher channel weights.
         per_layer_tier_configs: Optional per-layer tier configs.
         turbo_config: TurboQuant outlier-channel settings for Keys. None uses the
             SalienceCache default (TurboQuantConfig()).
@@ -166,7 +164,6 @@ def eval_salience(
         rescore_interval=rescore_interval,
         tier_config=tier_config or TierConfig(),
         per_layer_tier_configs=per_layer_tier_configs or {},
-        fisher_weights=fisher_weights,
         turbo_config=turbo_config,
     )
 
@@ -220,7 +217,6 @@ def run_reconstruction_comparison(
     states: CapturedStates,
     num_kv_heads: int,
     num_attention_heads: int,
-    fisher_weights=None,
     per_layer_tier_configs=None,
 ) -> list[MethodResult]:
     """Run all methods and return comparative results.
@@ -229,7 +225,6 @@ def run_reconstruction_comparison(
         states: Captured KV states from a model.
         num_kv_heads: Number of KV heads.
         num_attention_heads: Number of Q heads.
-        fisher_weights: Optional Fisher channel weights.
         per_layer_tier_configs: Optional per-layer tier configs from budget optimizer.
 
     Returns:
@@ -262,23 +257,13 @@ def run_reconstruction_comparison(
         name="SalienceQuant",
     ))
 
-    # 6. SalienceQuant with Fisher weights (if provided)
-    if fisher_weights is not None:
-        results.append(eval_salience(
-            states, num_kv_heads, num_attention_heads,
-            use_v_deviation=True,
-            fisher_weights=fisher_weights,
-            name="SalienceQuant (+Fisher)",
-        ))
-
-    # 7. SalienceQuant with per-layer budget (if provided)
+    # 6. SalienceQuant with per-layer budget (if provided)
     if per_layer_tier_configs is not None:
         results.append(eval_salience(
             states, num_kv_heads, num_attention_heads,
             use_v_deviation=True,
-            fisher_weights=fisher_weights,
             per_layer_tier_configs=per_layer_tier_configs,
-            name="SalienceQuant (+Fisher+Budget)",
+            name="SalienceQuant (+Budget)",
         ))
 
     return results

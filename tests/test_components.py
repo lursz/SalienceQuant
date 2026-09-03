@@ -344,45 +344,6 @@ class TestSalienceCache:
             k_out, v_out = cache.get_kv(layer_idx)
             assert k_out.shape[2] == seq_len
 
-    def test_with_fisher_weights(self):
-        """Test SalienceCache with Fisher channel weights."""
-        from src.salience.cache import SalienceCache
-        from src.salience.scoring.fisher import FisherChannelWeights
-
-        num_layers, num_kv_heads, head_dim = 2, 2, 32
-
-        # Create fake Fisher data
-        fisher_data = {
-            i: {
-                "key_fisher": torch.rand(num_kv_heads, head_dim),
-                "value_fisher": torch.rand(num_kv_heads, head_dim),
-            }
-            for i in range(num_layers)
-        }
-        fisher = FisherChannelWeights(fisher_data)
-
-        cache = SalienceCache(
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            num_attention_heads=4,
-            num_sink_tokens=2,
-            recent_window=8,
-            rescore_interval=1,
-            fisher_weights=fisher,
-        )
-
-        batch, q_heads, seq_len = 1, 4, 64
-        for layer_idx in range(num_layers):
-            k = torch.randn(batch, num_kv_heads, seq_len, head_dim)
-            v = torch.randn(batch, num_kv_heads, seq_len, head_dim)
-            attn = torch.softmax(torch.randn(batch, q_heads, 1, seq_len), dim=-1)
-            Q = torch.randn(batch, q_heads, 1, head_dim)
-            output = torch.randn(batch, q_heads, 1, head_dim)
-            cache.update(layer_idx, k, v, attn, Q, output)
-
-        k_out, v_out = cache.get_kv(0)
-        assert k_out.shape[2] == seq_len
-
 
 # --- TurboQuant ---
 
@@ -564,38 +525,3 @@ class TestBudget:
         assert configs[0].fp16_pct >= configs[1].fp16_pct
 
 
-# --- Fisher weights ---
-
-class TestFisherWeights:
-    def test_channel_weights_normalized(self):
-        from src.salience.scoring.fisher import FisherChannelWeights
-        data = {
-            0: {
-                "key_fisher": torch.tensor([[1.0, 5.0, 3.0, 2.0]]),
-                "value_fisher": torch.tensor([[0.5, 1.0, 0.8, 0.3]]),
-            }
-        }
-        fw = FisherChannelWeights(data)
-        weights = fw.get_channel_weights(0, "key")
-        assert weights.min() >= 0.0
-        assert weights.max() <= 1.0
-        # Channel 1 (value=5.0) should have highest weight
-        assert weights[0, 1] == 1.0
-
-    def test_save_load(self, tmp_path):
-        from src.salience.scoring.fisher import FisherChannelWeights
-        data = {
-            0: {
-                "key_fisher": torch.rand(2, 64),
-                "value_fisher": torch.rand(2, 64),
-            }
-        }
-        fw = FisherChannelWeights(data)
-        path = str(tmp_path / "fisher.pt")
-        fw.save(path)
-
-        fw2 = FisherChannelWeights.load(path)
-        assert torch.allclose(
-            fw2.get_channel_weights(0, "key"),
-            fw.get_channel_weights(0, "key"),
-        )
