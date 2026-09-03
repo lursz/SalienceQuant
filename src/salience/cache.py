@@ -6,15 +6,29 @@ Combines all components:
 - Multi-tier mixed-precision quantization
 - Optional TurboQuant quantizer hardening (rotation / codebook / channel overlay)
 - Dynamic re-scoring with promotion/demotion
+
+Storage model: the cache keeps the *reconstruction* (what a real cache would
+dequantize) plus, per token and side, the precision its data currently
+reflects. A rescore only re-quantizes a token when its new tier is coarser
+than what is already stored - re-quantizing unchanged tokens into freshly
+shifted group grids compounds error on every cycle, and a promotion cannot
+recover information a coarser grid already discarded. Memory is accounted
+logically from the tier assignment (packed codes plus fp16 scale and
+zero-point per group), matching GroupedQuant's billing.
 """
+
+import math
 
 import torch
 
 from src.salience.scoring.importance import ImportanceScorer
 from src.salience.scoring.sink_detector import get_protected_mask
-from src.salience.tiered import TieredQuantizer, TierConfig, assign_tiers
+from src.salience.tiered import Tier, TIER_BITS, TierConfig, assign_tiers
+from src.shared.quantize import quantize_dequantize_grouped
 from src.salience.turboquant import (
     TurboQuantConfig, detect_outlier_channels, random_rotation,
+    gather_outlier_channels, scatter_outlier_channels,
+    apply_outlier_channel_overlay,
 )
 
 
@@ -76,10 +90,15 @@ class SalienceCache:
 
         self.scorer = ImportanceScorer(num_layers, num_kv_heads, alpha)
 
-        # Per-layer storage
-        self._full_keys: dict[int, torch.Tensor] = {}     # FP16 full storage
-        self._full_values: dict[int, torch.Tensor] = {}
-        self._quantizers: dict[int, TieredQuantizer] = {}  # Quantized storage
+        # Per-layer reconstruction + the precision each token's data reflects
+        self._keys: dict[int, torch.Tensor] = {}
+        self._values: dict[int, torch.Tensor] = {}
+        self._key_bits: dict[int, torch.Tensor] = {}   # [seq_len], 16 = exact
+        self._val_bits: dict[int, torch.Tensor] = {}
+        # Last tier assignment per side (drives memory accounting)
+        self._key_tiers: dict[int, torch.Tensor] = {}
+        self._val_tiers: dict[int, torch.Tensor] = {}
+        self._overlay_masks: dict[int, torch.Tensor] = {}
 
         self._step: int = 0
         self._is_quantized: dict[int, bool] = {}
@@ -109,31 +128,20 @@ class SalienceCache:
             query_states: [batch, num_q_heads, query_len, head_dim] (for V-deviation)
             attention_output: [batch, num_q_heads, query_len, head_dim] (for V-deviation)
         """
-        # Append new KV states
-        if layer_idx in self._full_keys:
-            # If previously quantized, dequantize first
-            if self._is_quantized.get(layer_idx, False):
-                old_k, old_v = self._quantizers[layer_idx].dequantize()
-                self._full_keys[layer_idx] = torch.cat(
-                    [old_k.to(key_states.dtype), key_states], dim=2
-                )
-                self._full_values[layer_idx] = torch.cat(
-                    [old_v.to(value_states.dtype), value_states], dim=2
-                )
-                self._is_quantized[layer_idx] = False
-            else:
-                self._full_keys[layer_idx] = torch.cat(
-                    [self._full_keys[layer_idx], key_states], dim=2
-                )
-                self._full_values[layer_idx] = torch.cat(
-                    [self._full_values[layer_idx], value_states], dim=2
-                )
+        n_new = key_states.size(2)
+        fresh = torch.full((n_new,), 16, dtype=torch.long, device=key_states.device)
+        if layer_idx in self._keys:
+            self._keys[layer_idx] = torch.cat([self._keys[layer_idx], key_states], dim=2)
+            self._values[layer_idx] = torch.cat([self._values[layer_idx], value_states], dim=2)
+            self._key_bits[layer_idx] = torch.cat([self._key_bits[layer_idx], fresh])
+            self._val_bits[layer_idx] = torch.cat([self._val_bits[layer_idx], fresh])
         else:
-            self._full_keys[layer_idx] = key_states
-            self._full_values[layer_idx] = value_states
+            self._keys[layer_idx] = key_states
+            self._values[layer_idx] = value_states
+            self._key_bits[layer_idx] = fresh
+            self._val_bits[layer_idx] = fresh.clone()
 
-        # Track actual sequence length
-        self._seq_len = self._full_keys[layer_idx].size(2)
+        self._seq_len = self._keys[layer_idx].size(2)
 
         # Update attention-based scores (every step, cheap)
         self.scorer.update_attention(
@@ -145,7 +153,7 @@ class SalienceCache:
         if should_rescore and query_states is not None and attention_output is not None:
             self.scorer.update_key_importance(
                 layer_idx, attention_weights, query_states,
-                self._full_values[layer_idx], attention_output,
+                self._values[layer_idx], attention_output,
                 self.num_kv_groups,
             )
 
@@ -156,14 +164,8 @@ class SalienceCache:
                 self._requantize_all()
 
     def _requantize_all(self):
-        """Re-assign tiers and re-quantize all layers based on current scores."""
-        for layer_idx in list(self._full_keys.keys()):
-            # Ensure we have full precision data
-            if self._is_quantized.get(layer_idx, False):
-                k, v = self._quantizers[layer_idx].dequantize()
-                self._full_keys[layer_idx] = k.to(self._full_keys[layer_idx].dtype)
-                self._full_values[layer_idx] = v.to(self._full_values[layer_idx].dtype)
-
+        """Re-assign tiers on all layers and apply any demotions."""
+        for layer_idx in list(self._keys.keys()):
             self._quantize_layer(layer_idx)
 
     def _get_tier_config(self, layer_idx: int) -> TierConfig:
@@ -171,9 +173,9 @@ class SalienceCache:
         return self.per_layer_tier_configs.get(layer_idx, self.tier_config)
 
     def _quantize_layer(self, layer_idx: int):
-        """Quantize a single layer based on current importance scores."""
-        keys = self._full_keys[layer_idx]
-        values = self._full_values[layer_idx]
+        """Assign tiers and degrade tokens whose tier fell below their stored precision."""
+        keys = self._keys[layer_idx]
+        values = self._values[layer_idx]
         seq_len = keys.size(2)
 
         if seq_len <= self.num_sink_tokens + self.recent_window:
@@ -208,65 +210,160 @@ class SalienceCache:
         key_tiers = assign_tiers(key_imp, protected, tier_config)
         val_tiers = assign_tiers(val_imp, protected, tier_config)
 
-        # TurboQuant hardening: rotated-basis quant + normal codebook by default;
+        # TurboQuant hardening: rotation/codebook by default off;
         # legacy outlier-channel overlay only when channel_fraction > 0.
         tq = self.turbo_config
         rotation = (
             random_rotation(keys.size(-1), device=device) if tq.rotate else None
         )
-        key_overlay = None
+        overlay_mask = None
         if tq.channel_fraction > 0:
-            mask = detect_outlier_channels(keys, tq.channel_fraction)
-            key_overlay = (mask, keys.clone() if tq.overlay_bits >= 16 else keys)
+            overlay_mask = detect_outlier_channels(keys, tq.channel_fraction)
 
-        quantizer = TieredQuantizer(
-            group_size=tq.group_size, codebook=tq.codebook, rotation=rotation,
+        self._keys[layer_idx] = self._degrade(
+            keys, key_tiers, self._key_bits[layer_idx], axis=2,
+            rotation=rotation, overlay_mask=overlay_mask,
         )
-        quantizer.quantize_and_store(
-            keys, values, key_tiers, val_tiers,
-            key_outlier_overlay=key_overlay,
-            key_overlay_bits=tq.overlay_bits,
+        self._values[layer_idx] = self._degrade(
+            values, val_tiers, self._val_bits[layer_idx], axis=3,
+            rotation=rotation, overlay_mask=None,
         )
-        self._quantizers[layer_idx] = quantizer
+        self._key_tiers[layer_idx] = key_tiers
+        self._val_tiers[layer_idx] = val_tiers
+        if overlay_mask is not None:
+            self._overlay_masks[layer_idx] = overlay_mask
         self._is_quantized[layer_idx] = True
 
-        # Free full-precision storage (quantizer owns the data now)
-        self._full_keys[layer_idx] = keys[:, :, :0, :]
-        self._full_values[layer_idx] = values[:, :, :0, :]
+    def _degrade(
+        self,
+        tensor: torch.Tensor,
+        tiers: torch.Tensor,
+        stored_bits: torch.Tensor,
+        axis: int,
+        rotation: torch.Tensor | None,
+        overlay_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Quantize-dequantize only tokens whose new tier is coarser than stored.
+
+        Unchanged and promoted tokens keep their current reconstruction: their
+        codes would survive a real rescore untouched, so re-quantizing them
+        into freshly shifted group grids would only inject drift a deployed
+        cache never pays.
+        """
+        tq = self.turbo_config
+        out = tensor.clone()
+        for tier in Tier:
+            if tier == Tier.FP16:
+                continue
+            bits = TIER_BITS[tier]
+            idx = ((tiers == int(tier)) & (stored_bits > bits)).nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
+                continue
+            chunk = out[:, :, idx, :]
+            if rotation is not None:
+                chunk = chunk.float() @ rotation.T
+            deq = quantize_dequantize_grouped(
+                chunk, bits, axis=axis, group_size=tq.group_size, codebook=tq.codebook,
+            )
+            if rotation is not None:
+                deq = deq @ rotation
+            if overlay_mask is not None:
+                # protected key channels are stored at overlay precision instead
+                src = tensor[:, :, idx, :].float()
+                if tq.overlay_bits < 16:
+                    g = gather_outlier_channels(src, overlay_mask)
+                    g = quantize_dequantize_grouped(
+                        g, tq.overlay_bits, axis=2, group_size=tq.group_size)
+                    src = scatter_outlier_channels(src.clone(), g, overlay_mask)
+                deq = apply_outlier_channel_overlay(
+                    deq.float(), src, overlay_mask.to(deq.device), None)
+            out[:, :, idx, :] = deq.to(out.dtype)
+            stored_bits[idx] = bits
+        return out
 
     def get_kv(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Get KV states for attention computation.
 
-        Returns dequantized data for quantized layers, raw data otherwise.
-
         Returns:
             Tuple of (keys, values) in float.
         """
-        if self._is_quantized.get(layer_idx, False):
-            return self._quantizers[layer_idx].dequantize()
         return (
-            self._full_keys[layer_idx].float(),
-            self._full_values[layer_idx].float(),
+            self._keys[layer_idx].float(),
+            self._values[layer_idx].float(),
         )
 
     def memory_bytes(self) -> int:
-        """Total memory usage across all layers."""
+        """Total logical memory across layers.
+
+        Quantized layers bill packed codes at tier bits plus fp16 scale and
+        zero-point per group; FP16 tiers at 2 bytes/element. Unquantized
+        layers report their actual tensor size. The outlier-channel overlay
+        (ablation switch) bills the protected key channels of quantized
+        tokens at overlay precision instead of their tier's.
+        """
         total = 0
-        for layer_idx in self._full_keys:
-            if self._is_quantized.get(layer_idx, False):
-                total += self._quantizers[layer_idx].memory_bytes()["total"]
-            else:
-                k = self._full_keys[layer_idx]
-                v = self._full_values[layer_idx]
+        for layer_idx in self._keys:
+            if not self._is_quantized.get(layer_idx, False):
+                k = self._keys[layer_idx]
+                v = self._values[layer_idx]
                 total += k.nelement() * k.element_size()
                 total += v.nelement() * v.element_size()
+                continue
+            total += self._side_bytes(
+                self._keys[layer_idx], self._key_tiers[layer_idx], axis=2,
+                overlay_mask=self._overlay_masks.get(layer_idx),
+            )
+            total += self._side_bytes(
+                self._values[layer_idx], self._val_tiers[layer_idx], axis=3,
+                overlay_mask=None,
+            )
+        return total
+
+    def _side_bytes(
+        self,
+        tensor: torch.Tensor,
+        tiers: torch.Tensor,
+        axis: int,
+        overlay_mask: torch.Tensor | None,
+    ) -> int:
+        batch, heads, _, head_dim = tensor.shape
+        g = self.turbo_config.group_size
+        n_overlay_ch = int(overlay_mask.sum(dim=1)[0]) if overlay_mask is not None else 0
+        d_tier = head_dim - n_overlay_ch  # channels billed at tier precision
+        total = 0
+        n_quant_tokens = 0
+        for tier in Tier:
+            n = int((tiers == int(tier)).sum())
+            if n == 0:
+                continue
+            if tier == Tier.FP16:
+                total += batch * heads * n * head_dim * 2
+                continue
+            bits = TIER_BITS[tier]
+            n_quant_tokens += n
+            total += batch * heads * n * d_tier * bits // 8
+            if axis == 2:   # keys: groups along the token axis, per channel
+                total += batch * heads * d_tier * math.ceil(n / g) * 2 * 2
+            else:           # values: groups along head_dim, per token
+                total += batch * heads * n * math.ceil(head_dim / g) * 2 * 2
+        if overlay_mask is not None and n_quant_tokens > 0:
+            ob = self.turbo_config.overlay_bits
+            if ob >= 16:
+                total += batch * heads * n_quant_tokens * n_overlay_ch * 2
+            else:
+                total += batch * heads * n_quant_tokens * n_overlay_ch * ob // 8
+                total += batch * heads * n_overlay_ch * math.ceil(n_quant_tokens / g) * 2 * 2
         return total
 
     def clear(self):
         """Clear all cached data."""
-        self._full_keys.clear()
-        self._full_values.clear()
-        self._quantizers.clear()
+        self._keys.clear()
+        self._values.clear()
+        self._key_bits.clear()
+        self._val_bits.clear()
+        self._key_tiers.clear()
+        self._val_tiers.clear()
+        self._overlay_masks.clear()
         self._is_quantized.clear()
         self.scorer.reset()
         self._step = 0

@@ -344,6 +344,60 @@ class TestSalienceCache:
             k_out, v_out = cache.get_kv(layer_idx)
             assert k_out.shape[2] == seq_len
 
+    def test_rescore_does_not_drift_stable_tokens(self):
+        """Regression test for compounding re-quantization drift.
+
+        A token's reconstruction may only change when it is demoted to a
+        coarser tier; the ladder (16 -> 8 -> 4 -> 3 -> 2 bits) allows at most
+        4 demotions per position regardless of how many rescores run.
+        """
+        from src.salience.cache import SalienceCache
+        torch.manual_seed(0)
+
+        cache = SalienceCache(
+            num_layers=1,
+            num_kv_heads=2,
+            num_attention_heads=4,
+            num_sink_tokens=2,
+            recent_window=8,
+            rescore_interval=1,
+        )
+
+        batch, kv_heads, q_heads, chunk, head_dim = 1, 2, 4, 4, 32
+        prefix = 20
+        n_steps = 40
+
+        ref_k = []
+        prev_k = None
+        k_changes = torch.zeros(prefix, dtype=torch.long)
+
+        for step in range(n_steps):
+            k = torch.randn(batch, kv_heads, chunk, head_dim)
+            v = torch.randn(batch, kv_heads, chunk, head_dim)
+            ref_k.append(k)
+            kv_len = (step + 1) * chunk
+            attn = torch.softmax(torch.randn(batch, q_heads, chunk, kv_len), dim=-1)
+            q = torch.randn(batch, q_heads, chunk, head_dim)
+            out = torch.randn(batch, q_heads, chunk, head_dim)
+            cache.update(0, k, v, attn, q, out)
+
+            if kv_len < prefix:
+                continue
+            k_now = cache.get_kv(0)[0][:, :, :prefix, :]
+            if prev_k is not None:
+                changed = (k_now != prev_k).any(dim=(0, 1, 3))
+                k_changes += changed.long()
+            prev_k = k_now.clone()
+
+        assert int(k_changes.max()) <= 4, (
+            f"token reconstruction changed up to {int(k_changes.max())} times "
+            f"across {n_steps} rescores - re-quantization drift is back"
+        )
+
+        ref = torch.cat(ref_k, dim=2)[:, :, :prefix, :].float()
+        k_mse = torch.mean((ref - prev_k.float()) ** 2).item()
+        assert k_mse < 0.5, f"prefix K-MSE {k_mse:.3f} indicates compounded drift"
+
 
 # --- TurboQuant ---
 
