@@ -348,11 +348,8 @@ class TestSalienceCache:
         """Regression test for compounding re-quantization drift.
 
         A token's reconstruction may only change when it is demoted to a
-        coarser tier. The tier ladder (16 -> 8 -> 4 -> 3 -> 2 bits) allows at
-        most 4 demotions, so over many rescore cycles each position's stored
-        data may change at most 4 times. The buggy behaviour re-quantized
-        every token into freshly shifted group grids on every rescore, which
-        both changed reconstructions on every cycle and compounded error.
+        coarser tier; the ladder (16 -> 8 -> 4 -> 3 -> 2 bits) allows at most
+        4 demotions per position regardless of how many rescores run.
         """
         from src.salience.cache import SalienceCache
         torch.manual_seed(0)
@@ -363,11 +360,11 @@ class TestSalienceCache:
             num_attention_heads=4,
             num_sink_tokens=2,
             recent_window=8,
-            rescore_interval=1,  # rescore every step: worst case for drift
+            rescore_interval=1,
         )
 
         batch, kv_heads, q_heads, chunk, head_dim = 1, 2, 4, 4, 32
-        prefix = 20  # watch the first 20 tokens (quantized early)
+        prefix = 20
         n_steps = 40
 
         ref_k = []
@@ -388,19 +385,15 @@ class TestSalienceCache:
                 continue
             k_now = cache.get_kv(0)[0][:, :, :prefix, :]
             if prev_k is not None:
-                changed = (k_now != prev_k).any(dim=(0, 1, 3))  # [prefix]
+                changed = (k_now != prev_k).any(dim=(0, 1, 3))
                 k_changes += changed.long()
             prev_k = k_now.clone()
 
-        # Each position may change at most once per demotion step on the
-        # tier ladder; with drift, positions change on nearly every rescore.
         assert int(k_changes.max()) <= 4, (
             f"token reconstruction changed up to {int(k_changes.max())} times "
             f"across {n_steps} rescores - re-quantization drift is back"
         )
 
-        # And the error of early tokens must stay at single-quantization
-        # levels rather than compounding over ~40 rescore cycles.
         ref = torch.cat(ref_k, dim=2)[:, :, :prefix, :].float()
         k_mse = torch.mean((ref - prev_k.float()) ** 2).item()
         assert k_mse < 0.5, f"prefix K-MSE {k_mse:.3f} indicates compounded drift"
