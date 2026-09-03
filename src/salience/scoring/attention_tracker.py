@@ -52,12 +52,15 @@ class AttentionTracker:
             num_kv_groups: Number of Q heads per KV head (for GQA).
                 If model has 14 Q heads and 2 KV heads, num_kv_groups=7.
         """
-        # Sum attention from the current query across all positions
         # attention_weights: [batch, num_q_heads, query_len, kv_len]
-        # Take mean over batch and query_len, keep per-head
         attn = attention_weights.detach().float()
-        # [num_q_heads, kv_len] - mean over batch and query dims
-        attn = attn.mean(dim=(0, 2))
+        q_len, kv_len = attn.shape[2], attn.shape[3]
+        attn = attn.sum(dim=2).mean(dim=0)  # [num_q_heads, kv_len]
+        # Normalise by how many of this update's queries can causally attend to
+        # each key - dividing by the full query count biases late tokens toward
+        # zero (a token at position t is only visible to queries >= t).
+        counts = (kv_len - torch.arange(kv_len, device=attn.device, dtype=attn.dtype)).clamp(max=q_len)
+        attn = attn / counts
 
         # If GQA: aggregate Q heads that share the same KV head (mean)
         if num_kv_groups > 1:
