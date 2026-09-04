@@ -27,8 +27,8 @@
     "kv_mb": 2.92578125
   },
   {
-    "perplexity": 22.635732650756836,
-    "loss": 3.1195297191378186,
+    "perplexity": 19.250635147094727,
+    "loss": 2.9575440888308293,
     "num_tokens": 1531,
     "seq_len": 512,
     "method": "SalienceQuant (~3.3b)",
@@ -45,8 +45,8 @@
     "kv_mb": 3.1923828125
   },
   {
-    "perplexity": 14.90210247039795,
-    "loss": 2.7015022860875244,
+    "perplexity": 13.423344612121582,
+    "loss": 2.596995427824951,
     "num_tokens": 1531,
     "seq_len": 512,
     "method": "SalienceQuant (~3.7b)",

@@ -216,16 +216,29 @@ def _compute_window_importance(
     num_kv_heads: int,
     head_dim: int,
     num_kv_groups: int,
+    target_start: int = 0,
+    horizon: int = 32,
 ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
     """Pass 1: run the window unquantized and derive per-token K/V importance.
 
     Value importance  : attention mass received by each key token (H2O-style),
-                        normalised by the number of queries that can attend to it.
+                        normalised by the number of attending queries.
     Key importance    : received_attention * ||V(t) - mean_output|| * ||Q|| / sqrt(d)
                         - the V-deviation metric (the method's core contribution).
 
-    Both are aggregated across heads with max (protect a token if *any* head
-    needs it) and returned as [seq_len] tensors per layer.
+    Scoring is *causal*: token t is scored only with attention from queries in
+    ``[t, max(t + horizon, target_start))`` - the queries a streaming cache
+    would have seen before ever serving t quantised. A token spends its first
+    ``horizon`` steps in the FP16 recent window, so queries in that grace
+    period precede its first (and, under monotone-precision storage, decisive)
+    quantisation; context tokens keep being rescored until scoring begins at
+    ``target_start``. No query whose loss is scored can leak importance into
+    the precision of a token it reads quantised. The V-deviation normalisers
+    (mean attention output and typical query norm) likewise use only the
+    unscored prefix queries.
+
+    Both scores are aggregated across heads with max (protect a token if *any*
+    head needs it) and returned as [seq_len] tensors per layer.
     """
     num_layers = model.config.num_hidden_layers
     captured_q: dict[int, torch.Tensor] = {}
@@ -255,8 +268,14 @@ def _compute_window_importance(
             h.remove()
 
     seq_len = chunk.size(1)
-    # queries that can attend to token t (causal): positions t..seq_len-1
-    valid_counts = torch.arange(seq_len, 0, -1, device=chunk.device).float()  # [seq]
+    device = chunk.device
+    t_idx = torch.arange(seq_len, device=device)
+    # last query (exclusive) allowed to influence token t's precision
+    q_hi = torch.maximum(t_idx + max(horizon, 1),
+                         torch.full_like(t_idx, target_start)).clamp(max=seq_len)
+    counts = (q_hi - t_idx).float()
+    # normalisers come from the unscored prefix (whole window on the first one)
+    n_ctx = target_start if target_start > 0 else seq_len
 
     key_imp: dict[int, torch.Tensor] = {}
     val_imp: dict[int, torch.Tensor] = {}
@@ -264,19 +283,22 @@ def _compute_window_importance(
     for idx in range(num_layers):
         attn = outputs.attentions[idx].float().mean(dim=0)   # [qh, S, S], avg over batch
 
-        # received attention per (head, key token), normalised by attending queries
-        received = attn.sum(dim=1) / valid_counts.unsqueeze(0)   # [qh, S]
+        # attention received from allowed queries only: rows are causal
+        # (attn[q, t] = 0 for q < t), so a cumulative sum over the query axis
+        # evaluated at q_hi-1 sums exactly q in [t, q_hi)
+        cum = attn.cumsum(dim=1)                                 # [qh, S, S]
+        received = cum[:, q_hi - 1, t_idx] / counts              # [qh, S]
         val_imp[idx] = received.max(dim=0).values                # [S]
 
         # V-deviation: expand V to q-heads, output = attn @ V, deviation per token
         v = captured_v[idx].float().mean(dim=0)         # [kvh, S, hd]
         v_exp = v.repeat_interleave(num_kv_groups, dim=0)        # [qh, S, hd]
-        out = torch.matmul(attn, v_exp)                 # [qh, S, hd]
+        out = torch.matmul(attn[:, :n_ctx, :], v_exp)   # [qh, n_ctx, hd]
         out_mean = out.mean(dim=1, keepdim=True)        # [qh, 1, hd]
         v_dev = (v_exp - out_mean).norm(dim=-1)         # [qh, S]
 
         q = captured_q[idx].float().mean(dim=0)         # [qh, S, hd]
-        q_norm = q.norm(dim=-1)                         # [qh, S] (norm per query position)
+        q_norm = q[:, :n_ctx].norm(dim=-1)              # [qh, n_ctx]
         q_scale = q_norm.mean(dim=1, keepdim=True)      # [qh, 1] typical query magnitude
 
         k_score = received * v_dev * q_scale / (head_dim ** 0.5)  # [qh, S]
@@ -352,7 +374,9 @@ def evaluate_ppl_with_salience_quant(
 ) -> dict:
     """SalienceQuant mixed-precision KV cache PPL evaluation (two passes/window).
 
-    Pass 1 (FP16): derive per-token importance from the window's own attention.
+    Pass 1 (FP16): derive per-token importance from the window's own attention,
+    restricted causally so that no scored query informs the precision of a
+    token it reads quantised (see :func:`_compute_window_importance`).
     Pass 2: quantize each token to its tier (group-wise asymmetric) and score loss.
 
     ``turbo_config`` (default TurboQuantConfig()) controls optional quantizer
@@ -395,6 +419,8 @@ def evaluate_ppl_with_salience_quant(
 
         k_imp, v_imp = _compute_window_importance(
             model, chunk, num_kv_heads, head_dim, num_kv_groups,
+            target_start=0 if begin == 0 else seq_len - stride,
+            horizon=recent_window,
         )
         key_imp.clear(); key_imp.update(k_imp)
         val_imp.clear(); val_imp.update(v_imp)
