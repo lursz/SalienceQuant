@@ -1,0 +1,113 @@
+[
+  {
+    "name": "Uniform INT4",
+    "components": [
+      "uniform"
+    ],
+    "key_mse": 1.603265404701233,
+    "value_mse": 0.015197891741991043,
+    "key_cosine_sim": 0.98834228515625,
+    "value_cosine_sim": 0.9902229309082031,
+    "key_relative_error": 0.12999487684440797,
+    "value_relative_error": 0.13466040483169756,
+    "compression_ratio": 1.9393939393939394,
+    "avg_bits": 8.25,
+    "memory_mb": 3.09375,
+    "fp16_memory_mb": 6.0
+  },
+  {
+    "name": "+Attention scoring",
+    "components": [
+      "uniform",
+      "attention"
+    ],
+    "key_mse": 0.013149877078831196,
+    "value_mse": 0.007512275595217943,
+    "key_cosine_sim": 0.9991803169250488,
+    "value_cosine_sim": 0.9954468607902527,
+    "key_relative_error": 0.011772424318236979,
+    "value_relative_error": 0.09467355287765845,
+    "compression_ratio": 2.349634303743009,
+    "avg_bits": 6.809570312499999,
+    "memory_mb": 2.5535888671875,
+    "fp16_memory_mb": 6.0
+  },
+  {
+    "name": "+Multi-tier",
+    "components": [
+      "uniform",
+      "attention",
+      "multi-tier"
+    ],
+    "key_mse": 0.22079545259475708,
+    "value_mse": 0.12278103083372116,
+    "key_cosine_sim": 0.9870572686195374,
+    "value_cosine_sim": 0.940387487411499,
+    "key_relative_error": 0.048240353741962116,
+    "value_relative_error": 0.38275536686942274,
+    "compression_ratio": 3.3802351970290903,
+    "avg_bits": 4.7333984375,
+    "memory_mb": 1.7750244140625,
+    "fp16_memory_mb": 6.0
+  },
+  {
+    "name": "+Sinks",
+    "components": [
+      "uniform",
+      "attention",
+      "multi-tier",
+      "sinks"
+    ],
+    "key_mse": 0.22049860656261444,
+    "value_mse": 0.12218239903450012,
+    "key_cosine_sim": 0.987114667892456,
+    "value_cosine_sim": 0.9404144287109375,
+    "key_relative_error": 0.048207936802076475,
+    "value_relative_error": 0.3818212482416997,
+    "compression_ratio": 3.337203381199715,
+    "avg_bits": 4.79443359375,
+    "memory_mb": 1.79791259765625,
+    "fp16_memory_mb": 6.0
+  },
+  {
+    "name": "+EMA decay",
+    "components": [
+      "uniform",
+      "attention",
+      "multi-tier",
+      "sinks",
+      "ema"
+    ],
+    "key_mse": 0.22611825168132782,
+    "value_mse": 0.12128401547670364,
+    "key_cosine_sim": 0.9870133399963379,
+    "value_cosine_sim": 0.940281093120575,
+    "key_relative_error": 0.048818397544722586,
+    "value_relative_error": 0.38041513961675166,
+    "compression_ratio": 3.337203381199715,
+    "avg_bits": 4.79443359375,
+    "memory_mb": 1.79791259765625,
+    "fp16_memory_mb": 6.0
+  },
+  {
+    "name": "+V-deviation",
+    "components": [
+      "uniform",
+      "attention",
+      "multi-tier",
+      "sinks",
+      "ema",
+      "v-deviation"
+    ],
+    "key_mse": 0.2247573584318161,
+    "value_mse": 0.10883628576993942,
+    "key_cosine_sim": 0.9872238636016846,
+    "value_cosine_sim": 0.9399682879447937,
+    "key_relative_error": 0.04867125221802219,
+    "value_relative_error": 0.3603654659721713,
+    "compression_ratio": 3.337203381199715,
+    "avg_bits": 4.79443359375,
+    "memory_mb": 1.79791259765625,
+    "fp16_memory_mb": 6.0
+  }
+]
