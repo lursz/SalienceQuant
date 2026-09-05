@@ -14,9 +14,9 @@ jobs:
   # lint:
   #   runs-on: ubuntu-latest
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v7
 
-  #     - uses: astral-sh/setup-uv@v5
+  #     - uses: astral-sh/setup-uv@v10.0.1
 
   #     - name: Ruff lint
   #       run: uvx ruff@0.15.21 check src tests
@@ -27,9 +27,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: "3.14"
           enable-cache: true
