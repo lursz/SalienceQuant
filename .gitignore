@@ -133,3 +133,5 @@ dmypy.json
 # jax checkpoints and monitoring
 wandb/
 checkpoints/
+
+thesis/
