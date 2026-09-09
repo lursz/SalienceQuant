@@ -40,8 +40,7 @@ class KIVIQuantizedKVCache:
         self.residual_length = residual_length
         self.group_size = group_size
 
-        # layer_idx -> {"full_k", "full_v": FP16 residual tensors,
-        #               "chunks_k", "chunks_v": [GroupedQuant] of older token blocks}
+        # full_*: FP16 residual; chunks_*: [GroupedQuant] of older blocks
         self._cache: dict[int, dict] = {}
 
     def update(
@@ -58,7 +57,6 @@ class KIVIQuantizedKVCache:
             layer_idx: Layer index.
         """
         if layer_idx not in self._cache:
-            # First call: store everything in FP16
             self._cache[layer_idx] = {
                 "full_k": key_states,
                 "full_v": value_states,
@@ -89,14 +87,12 @@ class KIVIQuantizedKVCache:
         if overflow < self.group_size:
             return
 
-        # Keys: per-channel - group-wise along the token axis (dim=2).
-        # Values: per-token - group-wise along the head_dim axis (dim=3).
+        # keys per-channel (token axis), values per-token (head_dim axis)
         entry["chunks_k"].append(quantize_grouped(
             entry["full_k"][:, :, :overflow, :], self.bits, axis=2, group_size=self.group_size))
         entry["chunks_v"].append(quantize_grouped(
             entry["full_v"][:, :, :overflow, :], self.bits, axis=3, group_size=self.group_size))
 
-        # Keep only the residual portion in full precision
         entry["full_k"] = entry["full_k"][:, :, overflow:, :].contiguous()
         entry["full_v"] = entry["full_v"][:, :, overflow:, :].contiguous()
 
@@ -125,10 +121,9 @@ class KIVIQuantizedKVCache:
         """Total logical memory: packed codes + fp16 scale/zp + fp16 residual."""
         total = 0
         for entry in self._cache.values():
-            # Quantized chunks: logical packed size (codes + fp16 scale/zp)
             for gq in entry["chunks_k"] + entry["chunks_v"]:
                 total += gq.memory_bytes()
-            # FP16 residual: 2 bytes/elem (logical FP16, matching other methods)
+            # logical FP16, same as the other methods
             total += entry["full_k"].nelement() * 2
             total += entry["full_v"].nelement() * 2
         return total

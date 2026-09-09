@@ -47,15 +47,8 @@ def _kv_cache_mb(model: AutoModelForCausalLM, seq_len: int, k_avg_bits: float, v
     return elements * (k_avg_bits + v_avg_bits) / 8 / (1024 * 1024)
 
 
-# --------------------------------------------------------------------------
-# Effective-bits accounting (shared, so the comparison is apples-to-apples)
-#
-# Keys are grouped along the (long) token axis, so the group really holds
-# `group_size` elements. Values are grouped along the head_dim axis, so the
-# group holds at most `head_dim` elements - meaning a large group_size gives
-# values *more* scale/zp overhead than keys. We therefore account K and V
-# separately and report the mean.
-# --------------------------------------------------------------------------
+# Keys group along the token axis, values along head_dim (at most head_dim
+# elems per group), so scale/zp overhead differs - bill K and V separately.
 
 def _key_eff_bits(bits: int, group_size: int) -> float:
     return grouped_effective_bits(bits, group_size, asymmetric=True)
@@ -66,7 +59,7 @@ def _val_eff_bits(bits: int, group_size: int, head_dim: int) -> float:
 
 
 def _uniform_eff_bits(bits: int, group_size: int, head_dim: int) -> tuple[float, float]:
-    # uniform quantizes both K and V on the per-token (head_dim) axis
+    # both K and V on the per-token axis
     eb = _val_eff_bits(bits, group_size, head_dim)
     return eb, eb
 
@@ -206,10 +199,6 @@ def evaluate_ppl_with_kivi_quant(
     return result
 
 
-# --------------------------------------------------------------------------
-# SalienceQuant: two-pass mixed-precision evaluation
-# --------------------------------------------------------------------------
-
 def _compute_window_importance(
     model: AutoModelForCausalLM,
     chunk: torch.Tensor,
@@ -270,7 +259,6 @@ def _compute_window_importance(
     seq_len = chunk.size(1)
     device = chunk.device
     t_idx = torch.arange(seq_len, device=device)
-    # last query (exclusive) allowed to influence token t's precision
     q_hi = torch.maximum(t_idx + max(horizon, 1),
                          torch.full_like(t_idx, target_start)).clamp(max=seq_len)
     counts = (q_hi - t_idx).float()
@@ -281,16 +269,13 @@ def _compute_window_importance(
     val_imp: dict[int, torch.Tensor] = {}
 
     for idx in range(num_layers):
-        attn = outputs.attentions[idx].float().mean(dim=0)   # [qh, S, S], avg over batch
+        attn = outputs.attentions[idx].float().mean(dim=0)   # [qh, S, S]
 
-        # attention received from allowed queries only: rows are causal
-        # (attn[q, t] = 0 for q < t), so a cumulative sum over the query axis
-        # evaluated at q_hi-1 sums exactly q in [t, q_hi)
+        # rows are causal, so cumsum over queries at q_hi-1 sums exactly q in [t, q_hi)
         cum = attn.cumsum(dim=1)                                 # [qh, S, S]
         received = cum[:, q_hi - 1, t_idx] / counts              # [qh, S]
         val_imp[idx] = received.max(dim=0).values                # [S]
 
-        # V-deviation: expand V to q-heads, output = attn @ V, deviation per token
         v = captured_v[idx].float().mean(dim=0)         # [kvh, S, hd]
         v_exp = v.repeat_interleave(num_kv_groups, dim=0)        # [qh, S, hd]
         out = torch.matmul(attn[:, :n_ctx, :], v_exp)   # [qh, n_ctx, hd]
@@ -299,7 +284,7 @@ def _compute_window_importance(
 
         q = captured_q[idx].float().mean(dim=0)         # [qh, S, hd]
         q_norm = q[:, :n_ctx].norm(dim=-1)              # [qh, n_ctx]
-        q_scale = q_norm.mean(dim=1, keepdim=True)      # [qh, 1] typical query magnitude
+        q_scale = q_norm.mean(dim=1, keepdim=True)      # [qh, 1]
 
         k_score = received * v_dev * q_scale / (head_dim ** 0.5)  # [qh, S]
         key_imp[idx] = k_score.max(dim=0).values                  # [S]
@@ -509,10 +494,7 @@ def run_ppl_comparison(
     print("Uniform INT4...")
     add(evaluate_ppl_with_uniform_quant(model, tokenizer, bits=4, seq_len=seq_len, max_samples=max_samples, device=device))
 
-    # --- ~3.3 effective bits: the aggressive regime where KIVI hits its cliff.
-    #     KIVI cannot fit 3-bit here (needs >=~3.5 eff bits) so it must use 2-bit.
-    #     Salience budgets are fully billed and sit at or below the KIVI budget
-    #     they are paired with.
+    # ~3.3 eff bits: KIVI can't fit 3-bit here (needs ~3.5), so it drops to 2-bit
     print("KIVI 2-bit (~3.3b)...")
     add(evaluate_ppl_with_kivi_quant(model, tokenizer, bits=2, seq_len=seq_len, max_samples=max_samples,
                                      device=device, residual_length=32, group_size=64))
@@ -527,7 +509,7 @@ def run_ppl_comparison(
     )
     add(r)
 
-    # --- ~3.7 effective bits: KIVI can just fit 3-bit (near-lossless); we match it.
+    # ~3.7 eff bits: KIVI just fits 3-bit
     print("KIVI 3-bit (~3.7b)...")
     add(evaluate_ppl_with_kivi_quant(model, tokenizer, bits=3, seq_len=seq_len, max_samples=max_samples,
                                      device=device, residual_length=16, group_size=128))
@@ -542,7 +524,6 @@ def run_ppl_comparison(
     )
     add(r)
 
-    # --- near-lossless reference ---
     print("KIVI 4-bit (lossless ref)...")
     add(evaluate_ppl_with_kivi_quant(model, tokenizer, bits=4, seq_len=seq_len, max_samples=max_samples,
                                      device=device, residual_length=16, group_size=64))

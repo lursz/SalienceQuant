@@ -84,11 +84,10 @@ def evaluate_perplexity(
         outputs = model(chunk, output_attentions=output_attentions)
         logits = outputs.logits
 
-        # Shift logits and labels for next-token prediction
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = chunk[:, 1:].contiguous()
 
-        # Only count loss for tokens in the stride window (avoid double-counting)
+        # only score the stride window so tokens aren't double-counted
         target_start = 0 if begin == 0 else seq_len - stride
         shift_logits = shift_logits[:, target_start:, :]
         shift_labels = shift_labels[:, target_start:]

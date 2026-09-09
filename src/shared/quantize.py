@@ -47,15 +47,8 @@ def dequantize_symmetric(codes: torch.Tensor, scale: torch.Tensor) -> torch.Tens
     return codes.float() * scale
 
 
-# ---------------------------------------------------------------------------
-# Group-wise asymmetric quantization (KIVI / KVQuant style)
-# ---------------------------------------------------------------------------
-
-# Lloyd-Max optimal quantizer levels for a standard normal source (Max, 1960).
-# After a random rotation the per-coordinate distribution is near-Gaussian
-# (TurboQuant), so snapping standardized groups to these levels gives lower
-# MSE than uniform min-max at the same bit-width. Metadata cost is identical:
-# mean+std instead of min+max.
+# Lloyd-Max levels for N(0,1) (Max, 1960). Post-rotation coords are near-Gaussian,
+# so this beats min-max at equal bits; metadata cost is the same (mean+std vs min+max).
 _NORMAL_LEVELS = {
     1: [-0.7979, 0.7979],
     2: [-1.5104, -0.4528, 0.4528, 1.5104],
@@ -84,23 +77,23 @@ class GroupedQuant:
     ``[..., n_groups, group_size]`` along the moved axis;
     :func:`dequantize_grouped` reshapes back, drops padding, and restores the axis.
     """
-    codes: torch.Tensor          # quantized integers, grouped+padded layout
-    scale: torch.Tensor          # [..., n_groups, 1]  (std for "normal" codebook)
-    zero_point: torch.Tensor | None   # (mean for "normal" codebook)
+    codes: torch.Tensor
+    scale: torch.Tensor  # [..., n_groups, 1]; std for "normal"
+    zero_point: torch.Tensor | None  # mean for "normal"
     axis: int
     group_size: int
-    orig_len: int                # original length along `axis`, before padding
+    orig_len: int  # before padding
     bits: int
-    codebook: str = "uniform"    # "uniform" min-max grid or "normal" Lloyd-Max
+    codebook: str = "uniform"  # "uniform" | "normal"
 
     def memory_bytes(self) -> int:
         """Logical packed size: codes at `bits`/elem (unpadded) + scale/zp at 2 B each."""
         n_groups, group_size = self.codes.shape[-2], self.codes.shape[-1]
         n_real = self.codes.numel() // (n_groups * group_size) * self.orig_len
         total = n_real * self.bits // 8
-        total += self.scale.numel() * 2          # fp16 scale - realistic serving choice
+        total += self.scale.numel() * 2  # fp16
         if self.zero_point is not None:
-            total += self.zero_point.numel() * 2  # fp16 zero-point
+            total += self.zero_point.numel() * 2
         return total
 
 

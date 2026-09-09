@@ -39,10 +39,10 @@ from src.shared.quantize import quantize_dequantize_grouped
 class TurboQuantConfig:
     """TurboQuant quantizer settings (defaults = empirically best: all off)."""
     group_size: int = 64
-    rotate: bool = False         # random-rotation preprocessing (seeded, zero-cost)
+    rotate: bool = False  # seeded random rotation
     codebook: str = "uniform"    # "normal" Lloyd-Max or "uniform" min-max
-    channel_fraction: float = 0.0  # legacy outlier-channel overlay (0 = off)
-    overlay_bits: int = 8        # precision of overlay channels; 16 = FP16 restore
+    channel_fraction: float = 0.0  # legacy overlay, 0 = off
+    overlay_bits: int = 8  # 16 = FP16 restore
 
 
 _ROTATIONS: dict[tuple, torch.Tensor] = {}

@@ -60,7 +60,7 @@ class ImportanceScorer:
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
 
-        # EMA-tracked key importance scores per layer: [num_kv_heads, seq_len]
+        # [num_kv_heads, seq_len]
         self.key_scores: dict[int, torch.Tensor] = {}
         self.alpha = alpha
 
@@ -103,23 +103,18 @@ class ImportanceScorer:
                 The attention-weighted sum (weights @ V) before output projection.
             num_kv_groups: Q heads per KV head (for GQA).
         """
-        # Everything is taken at the *last* query position (most informative for
-        # autoregressive generation) and pooled to per-KV-head:
-        #   output, Q : [num_kv_heads, head_dim]
-        #   attn      : [num_kv_heads, kv_len]
+        # last query position only, pooled per KV head
         pool = lambda x: _pool_last_query_to_kv(x, self.num_kv_heads, num_kv_groups)
         output = pool(attention_output)
         Q = pool(query_states)
         attn = pool(attention_weights)
         head_dim = Q.size(-1)
 
-        # ||V(t) - output|| per token - how unusual token t's Value is vs. the
-        # current attention output (the term attention scores alone don't capture).
+        # how far token t's Value sits from what attention actually produced
         V = value_states.detach().float().mean(dim=0)        # [num_kv_heads, kv_len, head_dim]
         v_deviation_norm = (V - output.unsqueeze(1)).norm(dim=-1)  # [num_kv_heads, kv_len]
         q_norm = Q.norm(dim=-1)                               # [num_kv_heads]
 
-        # Key importance: attention(t) * ||V(t) - output|| * ||Q|| / sqrt(d)
         key_imp = attn * v_deviation_norm * q_norm.unsqueeze(1) / (head_dim ** 0.5)
 
         self.key_scores[layer_idx] = self._ema(self.key_scores.get(layer_idx), key_imp)
@@ -168,7 +163,7 @@ class ImportanceScorer:
                 return scores.max(dim=0).values
             return scores.mean(dim=0)
 
-        # Fallback to attention scores before first key importance update
+        # no key scores yet
         return self.get_value_importance(layer_idx, aggregation)
 
     def reset(self):

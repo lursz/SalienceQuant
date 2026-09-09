@@ -86,7 +86,6 @@ def run_ablation_experiment(args):
 
     states, num_kv_heads, num_attention_heads = _load_states(args)
 
-    # Optionally generate per-layer budget from sensitivity profile
     per_layer_configs = None
     if not args.no_budget and args.sensitivity_path:
         from src.salience.budget.optimizer import optimize_tier_configs
@@ -250,14 +249,14 @@ def main():
                         help="TurboQuant hardening for SalienceQuant PPL runs")
     parser.add_argument("--output", "-o", default=None, help="Output directory for results JSON")
 
-    # Synthetic data options (no model needed)
+    # synthetic
     parser.add_argument("--synthetic", action="store_true", help="Use synthetic data (no model)")
     parser.add_argument("--num-layers", type=int, default=4, help="Layers (synthetic)")
     parser.add_argument("--num-kv-heads", type=int, default=2, help="KV heads (synthetic)")
     parser.add_argument("--num-q-heads", type=int, default=4, help="Q heads (synthetic)")
     parser.add_argument("--head-dim", type=int, default=64, help="Head dim (synthetic)")
 
-    # Ablation options
+    # ablation
     parser.add_argument("--no-budget", action="store_true", help="Skip per-layer budget in ablation")
     parser.add_argument("--sensitivity-path", type=str, default=None,
                         help="Path to JSON sensitivity profile for per-layer budget")

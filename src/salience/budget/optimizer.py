@@ -18,7 +18,7 @@ from src.salience.tiered import TierConfig
 @dataclass
 class BudgetConfig:
     """Global budget configuration."""
-    target_avg_bits: float = 4.0  # Target average bits per element
+    target_avg_bits: float = 4.0
     num_sink_tokens: int = 4
     recent_window: int = 128
 
@@ -46,36 +46,29 @@ def compute_layer_bit_budget(
     Returns:
         Dict mapping layer_idx -> target average bits for that layer.
     """
-    # Normalize sensitivity to sum to num_layers
     sens_values = torch.tensor([
         layer_sensitivity.get(i, 0.5) for i in range(num_layers)
     ])
 
-    # Avoid zero sensitivity
     sens_values = sens_values.clamp(min=0.01)
 
-    # Water-filling: bits_i proportional to sqrt(sensitivity_i)
-    # (from rate-distortion theory: optimal rate ~ 0.5 * log2(variance * sensitivity))
+    # rate-distortion: rate ~ 0.5*log2(var*sens), so bits go as sqrt(sens)
     weights = sens_values.sqrt()
     weights = weights / weights.sum() * num_layers
 
-    # Scale to target average
     layer_bits = weights * target_avg_bits
 
-    # Iterative water-filling: clamp and redistribute excess/deficit
-    # until the target average is achieved (or max iterations reached)
+    # clamp, then push the leftover onto layers that still have room
     for _ in range(20):
         layer_bits = layer_bits.clamp(min=min_bits, max=max_bits)
         current_avg = layer_bits.mean().item()
         deficit = target_avg_bits - current_avg
         if abs(deficit) < 0.01:
             break
-        # Identify unclamped layers (not at min or max)
         unclamped = (layer_bits > min_bits + 0.01) & (layer_bits < max_bits - 0.01)
         n_unclamped = unclamped.sum().item()
         if n_unclamped == 0:
             break
-        # Distribute deficit evenly across unclamped layers
         layer_bits[unclamped] += deficit * num_layers / n_unclamped
 
     layer_bits = layer_bits.clamp(min=min_bits, max=max_bits)
@@ -101,23 +94,15 @@ def bits_to_tier_config(target_bits: float) -> TierConfig:
     target_bits = max(2.0, min(16.0, target_bits))
 
     if target_bits <= 2.0:
-        # 100% INT2
         return TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=0.0)
     elif target_bits <= 4.0:
-        # Blend INT2 (2-bit) and INT4 (4-bit)
-        # t=0 -> all INT2, t=1 -> all INT4
         t = (target_bits - 2.0) / 2.0
-        # Actual: t * 4 + (1-t) * 2 = 2 + 2t = target_bits ✓
         return TierConfig(fp16_pct=0.0, int8_pct=0.0, int4_pct=t)
     elif target_bits <= 8.0:
-        # Blend INT4 (4-bit) and INT8 (8-bit)
         t = (target_bits - 4.0) / 4.0
-        # Actual: t * 8 + (1-t) * 4 = 4 + 4t = target_bits ✓
         return TierConfig(fp16_pct=0.0, int8_pct=t, int4_pct=1.0 - t)
     else:
-        # Blend INT8 (8-bit) and FP16 (16-bit)
         t = (target_bits - 8.0) / 8.0
-        # Actual: t * 16 + (1-t) * 8 = 8 + 8t = target_bits ✓
         return TierConfig(fp16_pct=t, int8_pct=1.0 - t, int4_pct=0.0)
 
 

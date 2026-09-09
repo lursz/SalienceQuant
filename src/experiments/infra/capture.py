@@ -14,7 +14,6 @@ from src.shared.eval import load_wikitext2
 @dataclass
 class CapturedStates:
     """All states captured from a single forward pass."""
-    # Per-layer tensors
     keys: dict[int, torch.Tensor]          # [batch, kv_heads, seq_len, head_dim]
     values: dict[int, torch.Tensor]
     attention_weights: dict[int, torch.Tensor]  # [batch, q_heads, seq_len, seq_len]
@@ -50,11 +49,9 @@ def capture_states(
     num_kv_heads = getattr(model.config, "num_key_value_heads", num_q_heads)
     head_dim = model.config.hidden_size // num_q_heads
 
-    # Get calibration input
     input_ids = load_wikitext2(tokenizer, split="test")
     input_ids = input_ids[:, :seq_len].to(device)
 
-    # Storage for captured states
     captured_keys: dict[int, torch.Tensor] = {}
     captured_values: dict[int, torch.Tensor] = {}
     captured_attn: dict[int, torch.Tensor] = {}
@@ -63,10 +60,9 @@ def capture_states(
 
     hook_handles = []
 
-    # Query states aren't returned by the model, so hook q_proj to capture them.
-    # (Attention weights and K/V come straight from the forward outputs below.)
+    # q_proj hook: query states aren't in the forward outputs
     def make_q_hook(idx):
-        def hook_fn(module, _input, output):  # output: [batch, seq, num_q_heads*head_dim]
+        def hook_fn(module, _input, output):
             batch_sz, seqlen, _ = output.shape
             captured_q[idx] = output.view(
                 batch_sz, seqlen, num_q_heads, head_dim
@@ -80,23 +76,21 @@ def capture_states(
         hook_handles.append(h)
 
     try:
-        # Run forward pass with output_attentions=True
         outputs = model(
             input_ids,
             output_attentions=True,
             use_cache=True,
         )
 
-        # Extract KV from the cache
         past_kv = outputs.past_key_values
         for layer_idx in range(num_layers):
             if hasattr(past_kv, 'layers'):
-                # New DynamicCache format (transformers >= 4.x): layers list of DynamicLayer
+                # newer DynamicCache
                 layer_cache = past_kv.layers[layer_idx]
                 captured_keys[layer_idx] = layer_cache.keys.detach().cpu()
                 captured_values[layer_idx] = layer_cache.values.detach().cpu()
             elif hasattr(past_kv, 'key_cache'):
-                # Older DynamicCache format
+                # older DynamicCache
                 captured_keys[layer_idx] = past_kv.key_cache[layer_idx].detach().cpu()
                 captured_values[layer_idx] = past_kv.value_cache[layer_idx].detach().cpu()
             elif isinstance(past_kv, (list, tuple)):
@@ -105,20 +99,17 @@ def capture_states(
                     captured_keys[layer_idx] = kv_pair[0].detach().cpu()
                     captured_values[layer_idx] = kv_pair[1].detach().cpu()
 
-        # Extract attention weights from model outputs
         if outputs.attentions is not None:
             for layer_idx, attn_w in enumerate(outputs.attentions):
                 if attn_w is not None:
                     captured_attn[layer_idx] = attn_w.detach().cpu()
 
-        # Compute attention outputs from captured attention weights and values
-        # attn_output = attn_weights @ V_expanded  [batch, q_heads, seq, head_dim]
+        # attn_weights @ V_expanded
         num_groups = num_q_heads // num_kv_heads
         for layer_idx in range(num_layers):
             if layer_idx in captured_attn and layer_idx in captured_values:
                 attn_w = captured_attn[layer_idx]  # [batch, q_heads, seq, seq]
                 v = captured_values[layer_idx]      # [batch, kv_heads, seq, head_dim]
-                # Expand V from kv_heads to q_heads for GQA
                 v_expanded = v.unsqueeze(2).expand(-1, -1, num_groups, -1, -1)
                 v_expanded = v_expanded.reshape(
                     v.size(0), num_q_heads, v.size(2), head_dim
@@ -163,36 +154,29 @@ def generate_synthetic_states(
     attention_outputs = {}
 
     for layer_idx in range(num_layers):
-        # Keys: normal + per-channel outliers
         k = torch.randn(batch_size, num_kv_heads, seq_len, head_dim, device=device)
-        # Add channel outliers (some channels have 5x larger values)
+        # a few hot channels
         outlier_channels = torch.randint(0, head_dim, (head_dim // 8,))
         k[:, :, :, outlier_channels] *= 5.0
         keys[layer_idx] = k
 
-        # Values: normal + per-token outliers
         v = torch.randn(batch_size, num_kv_heads, seq_len, head_dim, device=device)
-        # Add token outliers (some tokens have 3x larger values)
+        # a few hot tokens
         outlier_tokens = torch.randint(0, seq_len, (seq_len // 10,))
         v[:, :, outlier_tokens, :] *= 3.0
         values[layer_idx] = v
 
-        # Attention with sink pattern
         attn = torch.randn(batch_size, num_q_heads, seq_len, seq_len, device=device)
-        # Boost first 4 tokens (attention sinks)
+        # sinks
         attn[:, :, :, :4] += 3.0
-        # Apply causal mask
         causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
         attn.masked_fill_(causal_mask.bool().unsqueeze(0).unsqueeze(0), float('-inf'))
         attn = torch.softmax(attn, dim=-1)
         attention_weights[layer_idx] = attn
 
-        # Query states
         q = torch.randn(batch_size, num_q_heads, seq_len, head_dim, device=device)
         query_states[layer_idx] = q
 
-        # Attention output: weighted sum of values
-        # Reshape for GQA: expand V from kv_heads to q_heads
         num_groups = num_q_heads // num_kv_heads
         v_expanded = v.unsqueeze(2).expand(-1, -1, num_groups, -1, -1)
         v_expanded = v_expanded.reshape(batch_size, num_q_heads, seq_len, head_dim)

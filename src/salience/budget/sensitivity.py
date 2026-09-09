@@ -51,7 +51,6 @@ def profile_layer_sensitivity(
 
     num_layers = model.config.num_hidden_layers
 
-    # Step 1: Baseline perplexity (no quantization)
     print("Computing baseline perplexity...")
     baseline = evaluate_perplexity(
         model, tokenizer, seq_len=seq_len, max_samples=max_samples
@@ -59,20 +58,19 @@ def profile_layer_sensitivity(
     baseline_ppl = baseline["perplexity"]
     print(f"  Baseline PPL: {baseline_ppl:.2f}")
 
-    # Step 2: Per-layer quantization
     layer_ppl = {}
 
     num_kv_heads = getattr(model.config, "num_key_value_heads", model.config.num_attention_heads)
     head_dim = model.config.hidden_size // model.config.num_attention_heads
 
     for layer_idx in tqdm(range(num_layers), desc="Profiling layers"):
-        # Register hooks that quantize K and V projections for this layer only
+        # quantize only this layer's K/V
         layer = model.model.layers[layer_idx]
-        # K: per-channel quantization (dim=2)
+        # per-channel
         h_k = layer.self_attn.k_proj.register_forward_hook(
             make_proj_quant_hook(bits, num_kv_heads, head_dim, quant_dim=2)
         )
-        # V: per-token quantization (dim=-1)
+        # per-token
         h_v = layer.self_attn.v_proj.register_forward_hook(
             make_proj_quant_hook(bits, num_kv_heads, head_dim, quant_dim=-1)
         )
@@ -86,14 +84,12 @@ def profile_layer_sensitivity(
             h_k.remove()
             h_v.remove()
 
-    # Step 3: Compute sensitivity
     layer_sensitivity = {
         idx: ppl - baseline_ppl for idx, ppl in layer_ppl.items()
     }
 
-    # Normalize to [0, 1]
     max_sens = max(layer_sensitivity.values()) if layer_sensitivity else 1.0
-    max_sens = max(max_sens, 1e-8)  # avoid division by zero
+    max_sens = max(max_sens, 1e-8)
     layer_sensitivity_normalized = {
         idx: sens / max_sens for idx, sens in layer_sensitivity.items()
     }

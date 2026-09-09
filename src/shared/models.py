@@ -4,7 +4,6 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-# Default model sizes for experiments
 QWEN_MODELS = {
     "0.5b": "Qwen/Qwen2.5-0.5B",
     "1.5b": "Qwen/Qwen2.5-1.5B",

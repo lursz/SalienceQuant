@@ -34,7 +34,7 @@ class AttentionTracker:
         self.num_kv_heads = num_kv_heads
         self.alpha = alpha
 
-        # Per-layer, per-KV-head cumulative scores: [num_kv_heads, seq_len]
+        # [num_kv_heads, seq_len]
         self.scores: dict[int, torch.Tensor] = {}
 
     def update(
@@ -52,43 +52,37 @@ class AttentionTracker:
             num_kv_groups: Number of Q heads per KV head (for GQA).
                 If model has 14 Q heads and 2 KV heads, num_kv_groups=7.
         """
-        # attention_weights: [batch, num_q_heads, query_len, kv_len]
         attn = attention_weights.detach().float()
         q_len, kv_len = attn.shape[2], attn.shape[3]
         attn = attn.sum(dim=2).mean(dim=0)  # [num_q_heads, kv_len]
-        # Normalise by how many of this update's queries can causally attend to
-        # each key - dividing by the full query count biases late tokens toward
-        # zero (a token at position t is only visible to queries >= t).
+        # divide by how many queries can causally see each key; using q_len biases late tokens to zero
         counts = (kv_len - torch.arange(kv_len, device=attn.device, dtype=attn.dtype)).clamp(max=q_len)
         attn = attn / counts
 
-        # If GQA: aggregate Q heads that share the same KV head (mean)
+        # GQA: mean over Q heads sharing a KV head
         if num_kv_groups > 1:
             num_q_heads, kv_len = attn.shape
             attn = attn.view(self.num_kv_heads, num_kv_groups, kv_len).mean(dim=1)
-        # attn: [num_kv_heads, kv_len]
 
         kv_len = attn.size(1)
 
         if layer_idx not in self.scores:
-            # First update: initialize scores directly
             self.scores[layer_idx] = attn
         else:
             prev = self.scores[layer_idx]
             prev_len = prev.size(1)
 
             if kv_len > prev_len:
-                # New tokens appeared - extend with zeros then update
+                # new tokens
                 pad = torch.zeros(
                     self.num_kv_heads, kv_len - prev_len,
                     device=prev.device, dtype=prev.dtype,
                 )
                 prev = torch.cat([prev, pad], dim=1)
             elif kv_len < prev_len:
-                # Sequence shrunk (cache reset or reuse) - truncate
+                # cache reset or reuse
                 prev = prev[:, :kv_len]
 
-            # EMA update
             self.scores[layer_idx] = (1 - self.alpha) * prev + self.alpha * attn
 
     def get_token_importance(

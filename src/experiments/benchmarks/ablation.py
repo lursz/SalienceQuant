@@ -105,13 +105,12 @@ def run_ablation(
     num_layers = states.num_layers
     results = []
 
-    # Collect reference KV
     ref_keys_list = [states.keys[i] for i in sorted(states.keys.keys())]
     ref_vals_list = [states.values[i] for i in sorted(states.values.keys())]
     ref_k_cat = torch.cat(ref_keys_list, dim=2)
     ref_v_cat = torch.cat(ref_vals_list, dim=2)
 
-    # ---- Ablation 1: Uniform INT4 (no importance) ----
+    # 1: uniform INT4
     approx_k_list, approx_v_list, total_mem = [], [], 0
     for layer_idx in sorted(states.keys.keys()):
         k_hat, v_hat, mem = _uniform_quantize_kv(
@@ -128,7 +127,7 @@ def run_ablation(
     )
     results.append(AblationResult("Uniform INT4", ["uniform"], metrics))
 
-    # ---- Ablation 2: +Attention scoring (2-tier: FP16 for top-20%, INT4 rest) ----
+    # 2: +attention scoring, 2-tier
     tracker = AttentionTracker(num_layers, num_kv_heads, alpha=1.0)  # alpha=1 = no EMA
     for layer_idx in sorted(states.attention_weights.keys()):
         attn = states.attention_weights[layer_idx]
@@ -161,9 +160,9 @@ def run_ablation(
     )
     results.append(AblationResult("+Attention scoring", ["uniform", "attention"], metrics))
 
-    # ---- Ablation 3: +Multi-tier (FP16/INT8/INT4/INT2) ----
+    # 3: +multi-tier
     approx_k_list, approx_v_list, total_mem = [], [], 0
-    default_config = TierConfig()  # 5% FP16, 15% INT8, 30% INT4, 50% INT2
+    default_config = TierConfig()
     for layer_idx in sorted(states.keys.keys()):
         k = states.keys[layer_idx]
         v = states.values[layer_idx]
@@ -185,7 +184,7 @@ def run_ablation(
     )
     results.append(AblationResult("+Multi-tier", ["uniform", "attention", "multi-tier"], metrics))
 
-    # ---- Ablation 4: +Attention sinks ----
+    # 4: +sinks
     approx_k_list, approx_v_list, total_mem = [], [], 0
     for layer_idx in sorted(states.keys.keys()):
         k = states.keys[layer_idx]
@@ -208,9 +207,7 @@ def run_ablation(
     )
     results.append(AblationResult("+Sinks", ["uniform", "attention", "multi-tier", "sinks"], metrics))
 
-    # ---- Ablation 5: +EMA decay ----
-    # Streamed block updates so alpha matters: recency-weighted scores
-    # vs. the whole-window average of rows 2-4.
+    # 5: +EMA decay, streamed in blocks so alpha actually matters
     ema_tracker = AttentionTracker(num_layers, num_kv_heads, alpha=0.2)
     _replay_attention_blocks(
         lambda idx, attn: ema_tracker.update(idx, attn, num_kv_groups), states,
@@ -238,10 +235,7 @@ def run_ablation(
     )
     results.append(AblationResult("+EMA decay", ["uniform", "attention", "multi-tier", "sinks", "ema"], metrics))
 
-    # ---- Ablation 6: +V-deviation ----
-    # Value importance streamed like row 5 (cumulative ablation); the
-    # V-deviation key metric is computed once on the full window, as in
-    # SalienceCache's periodic re-scoring.
+    # 6: +V-deviation; key metric computed once on the full window, like SalienceCache's rescoring
     scorer = ImportanceScorer(num_layers, num_kv_heads, alpha=0.2)
     _replay_attention_blocks(
         lambda idx, attn: scorer.update_attention(idx, attn, num_kv_groups), states,
@@ -264,7 +258,6 @@ def run_ablation(
 
         key_imp = scorer.get_key_importance(layer_idx)
         val_imp = scorer.get_value_importance(layer_idx)
-        # Ensure matching size
         key_imp = _pad_or_trim(key_imp, seq_len)
         val_imp = _pad_or_trim(val_imp, seq_len)
         combined = torch.max(key_imp, val_imp)
@@ -288,7 +281,7 @@ def run_ablation(
         metrics,
     ))
 
-    # ---- Ablation 7: +Per-layer budget (if configs provided) ----
+    # 7: +per-layer budget
     if per_layer_tier_configs:
         approx_k_list, approx_v_list, total_mem = [], [], 0
         for layer_idx in sorted(states.keys.keys()):

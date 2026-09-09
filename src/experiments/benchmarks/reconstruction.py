@@ -65,7 +65,6 @@ def eval_uniform(states: CapturedStates, bits: int = 4) -> MethodResult:
         k = states.keys[layer_idx]
         v = states.values[layer_idx]
 
-        # Quantize and dequantize
         q_k, s_k = quantize_symmetric(k, bits, dim=-1)
         k_hat = dequantize_symmetric(q_k, s_k)
 
@@ -77,7 +76,7 @@ def eval_uniform(states: CapturedStates, bits: int = 4) -> MethodResult:
         all_ref_v.append(v)
         all_approx_v.append(v_hat)
 
-        # Memory: logical packed size for quantized + actual size for scales
+        # packed codes + real scale bytes
         total_bytes += q_k.nelement() * bits // 8
         total_bytes += s_k.nelement() * s_k.element_size()
         total_bytes += q_v.nelement() * bits // 8
@@ -167,14 +166,12 @@ def eval_salience(
         turbo_config=turbo_config,
     )
 
-    # Feed all states into the cache
     for layer_idx in sorted(states.keys.keys()):
         k = states.keys[layer_idx]
         v = states.values[layer_idx]
         attn = states.attention_weights.get(layer_idx)
 
         if attn is None:
-            # Generate dummy attention if not captured
             attn = torch.softmax(
                 torch.randn(1, num_attention_heads, 1, k.size(2)), dim=-1
             )
@@ -187,7 +184,6 @@ def eval_salience(
         else:
             cache.update(layer_idx, k, v, attn)
 
-    # Collect reconstruction
     all_ref_k, all_approx_k = [], []
     all_ref_v, all_approx_v = [], []
 
@@ -232,32 +228,26 @@ def run_reconstruction_comparison(
     """
     results = []
 
-    # 1. FP16 baseline
     results.append(eval_fp16_baseline(states))
 
-    # 2. Uniform baselines
     results.append(eval_uniform(states, bits=8))
     results.append(eval_uniform(states, bits=4))
 
-    # 3. KIVI baselines
     results.append(eval_kivi(states, bits=4, residual_length=128))
     results.append(eval_kivi(states, bits=2, residual_length=128))
 
-    # 4. SalienceQuant - attention only (ablation: no V-deviation)
     results.append(eval_salience(
         states, num_kv_heads, num_attention_heads,
         use_v_deviation=False,
         name="SalienceQuant (attn-only)",
     ))
 
-    # 5. SalienceQuant - full (V-deviation + TurboQuant key channels)
     results.append(eval_salience(
         states, num_kv_heads, num_attention_heads,
         use_v_deviation=True,
         name="SalienceQuant",
     ))
 
-    # 6. SalienceQuant with per-layer budget (if provided)
     if per_layer_tier_configs is not None:
         results.append(eval_salience(
             states, num_kv_heads, num_attention_heads,

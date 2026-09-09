@@ -3,8 +3,6 @@
 import torch
 
 
-# --- Quantization primitives ---
-
 class TestUniformQuantization:
     def test_symmetric_roundtrip_8bit(self):
         from src.shared.quantize import quantize_symmetric, dequantize_symmetric
@@ -20,14 +18,13 @@ class TestUniformQuantization:
         q, s = quantize_symmetric(x, bits=2, dim=-1)
         x_hat = dequantize_symmetric(q, s)
         assert x_hat.shape == x.shape
-        # 2-bit has much larger error but should still reconstruct
         assert (x - x_hat).abs().mean() < 1.0
 
 
 class TestGroupedQuantization:
     def test_roundtrip_shape_and_arbitrary_length(self):
         from src.shared.quantize import quantize_grouped, dequantize_grouped
-        # length not divisible by group_size must still round-trip exactly in shape
+        # length not divisible by group_size
         x = torch.randn(1, 2, 130, 64)
         gq = quantize_grouped(x, bits=4, axis=2, group_size=64)
         x_hat = dequantize_grouped(gq)
@@ -55,10 +52,10 @@ class TestGroupedQuantization:
     def test_memory_bytes_matches_logical_size(self):
         """Regression: memory_bytes must not double-count by n_groups."""
         from src.shared.quantize import quantize_grouped
-        x = torch.randn(1, 2, 256, 64)  # 32768 real elements
+        x = torch.randn(1, 2, 256, 64)
         gq = quantize_grouped(x, bits=4, axis=2, group_size=64)
-        codes_bytes = 32768 * 4 // 8  # 4-bit packed
-        # scale + zp overhead is small; total should be within a modest margin
+        codes_bytes = 32768 * 4 // 8
+        # leave room for scale/zp overhead
         assert codes_bytes <= gq.memory_bytes() < codes_bytes * 1.5
 
     def test_effective_bits_overhead(self):
@@ -85,7 +82,7 @@ class TestKIVIQuantization:
         v = torch.randn(1, 2, 128, 64)
         cache.update(k, v, layer_idx=0)
         k_out, v_out = cache.get_kv(0)
-        # Last 32 tokens should be exact (FP16 residual)
+        # FP16 residual
         assert torch.allclose(k[:, :, -32:, :], k_out[:, :, -32:, :], atol=1e-5)
 
     def test_streaming_updates_keep_all_tokens(self):
@@ -106,18 +103,15 @@ class TestKIVIQuantization:
         # earliest tokens must survive with only INT8-level error
         assert (k[:, :, :64, :] - k_out[:, :, :64, :]).pow(2).mean() < 1e-3
         assert (v[:, :, :64, :] - v_out[:, :, :64, :]).pow(2).mean() < 1e-3
-        # most recent tokens are exact FP16 residual
         assert torch.allclose(k[:, :, -32:, :], k_out[:, :, -32:, :], atol=1e-5)
 
-
-# --- Scoring components ---
 
 class TestAttentionTracker:
     def test_basic_tracking(self):
         from src.salience.scoring.attention_tracker import AttentionTracker
         tracker = AttentionTracker(num_layers=2, num_kv_heads=2, alpha=0.3)
 
-        # Simulate attention weights: [batch=1, q_heads=4, q_len=1, kv_len=10]
+        # [batch=1, q_heads=4, q_len=1, kv_len=10]
         attn = torch.softmax(torch.randn(1, 4, 1, 10), dim=-1)
         tracker.update(layer_idx=0, attention_weights=attn, num_kv_groups=2)
 
@@ -129,7 +123,6 @@ class TestAttentionTracker:
         from src.salience.scoring.attention_tracker import AttentionTracker
         tracker = AttentionTracker(num_layers=1, num_kv_heads=1, alpha=0.5)
 
-        # First step: token 0 gets all attention
         attn1 = torch.zeros(1, 1, 1, 5)
         attn1[0, 0, 0, 0] = 1.0
         tracker.update(0, attn1, num_kv_groups=1)
@@ -137,13 +130,11 @@ class TestAttentionTracker:
         score_after_1 = tracker.get_token_importance(0).clone()
         assert score_after_1[0] > score_after_1[1]
 
-        # Second step: token 4 gets all attention
         attn2 = torch.zeros(1, 1, 1, 5)
         attn2[0, 0, 0, 4] = 1.0
         tracker.update(0, attn2, num_kv_groups=1)
 
         score_after_2 = tracker.get_token_importance(0)
-        # Token 0 should have decayed, token 4 should have increased
         assert score_after_2[0] < score_after_1[0]
         assert score_after_2[4] > score_after_1[4]
 
@@ -182,23 +173,19 @@ class TestImportanceScorer:
         scorer = ImportanceScorer(num_layers=1, num_kv_heads=1, alpha=1.0)
 
         seq_len, head_dim = 10, 64
-        # Uniform attention
         attn = torch.ones(1, 1, 1, seq_len) / seq_len
 
         Q = torch.randn(1, 1, 1, head_dim)
-        V = torch.randn(1, 1, seq_len, head_dim) * 0.1  # small values
-        # Make token 5 have a very different value
+        V = torch.randn(1, 1, seq_len, head_dim) * 0.1
+        # token 5 is the odd one out
         V[0, 0, 5, :] = torch.randn(head_dim) * 10.0
 
         output = (attn.unsqueeze(-1) * V.unsqueeze(2)).sum(dim=3).squeeze(3)
-        # output ≈ mean of V, which is dominated by the small values
-        # So V[5] - output is large
 
         scorer.update_attention(0, attn, num_kv_groups=1)
         scorer.update_key_importance(0, attn, Q, V, output, num_kv_groups=1)
 
         key_imp = scorer.get_key_importance(0)
-        # Token 5 should have highest key importance due to V-deviation
         assert key_imp[5] == key_imp.max(), (
             f"Token 5 (unusual V) should be most important, got: {key_imp}"
         )
@@ -219,12 +206,10 @@ class TestSinkDetector:
         assert not mask[50].item() # middle tokens not protected
 
 
-# --- Tiered quantization ---
-
 class TestTieredQuantizer:
     def test_tier_assignment(self):
         from src.salience.tiered import assign_tiers, TierConfig, Tier
-        scores = torch.arange(100, dtype=torch.float)  # 0..99
+        scores = torch.arange(100, dtype=torch.float)
         protected = torch.zeros(100, dtype=torch.bool)
         protected[:4] = True  # sinks
 
@@ -232,7 +217,6 @@ class TestTieredQuantizer:
         tiers = assign_tiers(scores, protected, config)
 
         assert (tiers[:4] == Tier.FP16).all()  # sinks
-        # Highest scored non-protected tokens should be FP16/INT8
         assert tiers[99] == Tier.FP16  # top token
 
     def test_quantize_dequantize_roundtrip(self):
@@ -253,7 +237,6 @@ class TestTieredQuantizer:
         assert k_out.shape == k.shape
         assert v_out.shape == v.shape
 
-        # FP16 tokens should be exact
         fp16_mask = tiers == 0
         fp16_indices = fp16_mask.nonzero(as_tuple=True)[0]
         if fp16_indices.numel() > 0:
@@ -276,12 +259,9 @@ class TestTieredQuantizer:
         quantizer.quantize_and_store(k, v, tiers)
 
         mem = quantizer.memory_bytes()
-        fp16_full = k.nelement() * 2 + v.nelement() * 2  # 2 bytes per FP16
-        # Tiered should use less memory than full FP16
+        fp16_full = k.nelement() * 2 + v.nelement() * 2
         assert mem["total"] < fp16_full
 
-
-# --- SalienceCache integration ---
 
 class TestSalienceCache:
     def test_basic_flow(self):
@@ -292,7 +272,7 @@ class TestSalienceCache:
             num_attention_heads=4,
             num_sink_tokens=2,
             recent_window=8,
-            rescore_interval=1,  # re-score every step for testing
+            rescore_interval=1,  # rescore every step
         )
 
         batch, kv_heads, q_heads, seq_len, head_dim = 1, 2, 4, 64, 32
@@ -306,7 +286,6 @@ class TestSalienceCache:
 
             cache.update(layer_idx, k, v, attn, Q, output)
 
-        # Should be able to retrieve KV
         k_out, v_out = cache.get_kv(0)
         assert k_out.shape[2] == seq_len
         assert v_out.shape[2] == seq_len
@@ -317,7 +296,7 @@ class TestSalienceCache:
         from src.salience.budget.optimizer import optimize_tier_configs
 
         num_layers = 4
-        # Fake sensitivity: layers 0 and 3 are most sensitive
+        # layers 0 and 3 most sensitive
         sensitivity = {0: 1.0, 1: 0.2, 2: 0.3, 3: 0.9}
         per_layer_configs = optimize_tier_configs(num_layers, sensitivity, target_avg_bits=4.0)
 
@@ -399,13 +378,11 @@ class TestSalienceCache:
         assert k_mse < 0.5, f"prefix K-MSE {k_mse:.3f} indicates compounded drift"
 
 
-# --- TurboQuant ---
-
 class TestTurboQuant:
     def test_detect_outlier_channels_fraction(self):
         from src.salience.turboquant import detect_outlier_channels
         keys = torch.randn(1, 2, 32, 64)
-        keys[:, :, :, 0] *= 10.0  # make channel 0 an outlier
+        keys[:, :, :, 0] *= 10.0
         mask = detect_outlier_channels(keys, outlier_fraction=0.10)
         assert mask.shape == (2, 64)
         assert mask.any()
@@ -477,8 +454,8 @@ class TestTurboQuant:
 
         mse16, mem16 = run(16)
         mse8, mem8 = run(8)
-        assert mse8 < mse16 * 1.05  # near-identical protection quality
-        assert mem8 < mem16          # at lower billed memory
+        assert mse8 < mse16 * 1.05  # same protection quality
+        assert mem8 < mem16  # for less memory
 
     def test_overlay_does_not_degrade_fp16_tier_tokens(self):
         from src.salience.tiered import TieredQuantizer, TierConfig, assign_tiers, Tier
@@ -524,8 +501,6 @@ class TestTurboQuant:
         assert k_out.shape[2] == seq_len
 
 
-# --- Budget optimizer ---
-
 class TestBudget:
     def test_layer_bit_budget(self):
         from src.salience.budget.optimizer import compute_layer_bit_budget
@@ -533,27 +508,22 @@ class TestBudget:
         bits = compute_layer_bit_budget(4, sensitivity, target_avg_bits=4.0)
 
         assert len(bits) == 4
-        # Most sensitive layer should get most bits
         assert bits[0] > bits[1]
-        # Average should be close to target
         avg = sum(bits.values()) / len(bits)
         assert abs(avg - 4.0) < 0.5
 
     def test_bits_to_tier_config(self):
         from src.salience.budget.optimizer import bits_to_tier_config
-        # At 2 bits: almost all INT2
         config_2 = bits_to_tier_config(2.0)
         assert config_2.int2_pct > 0.9
 
-        # At 8 bits: 100% INT8 (exact analytical solution)
         config_8 = bits_to_tier_config(8.0)
         assert config_8.int8_pct == 1.0
 
-        # At 12 bits: blend of FP16 and INT8
         config_12 = bits_to_tier_config(12.0)
         assert config_12.fp16_pct > config_2.fp16_pct
 
-        # Verify analytical correctness: actual bits match target
+        # actual bits must hit the target exactly
         for target in [2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0]:
             c = bits_to_tier_config(target)
             actual = c.fp16_pct * 16 + c.int8_pct * 8 + c.int4_pct * 4 + c.int2_pct * 2
@@ -575,7 +545,6 @@ class TestBudget:
         from src.salience.budget.optimizer import optimize_tier_configs
         sensitivity = {0: 1.0, 1: 0.01}
         configs = optimize_tier_configs(2, sensitivity, target_avg_bits=4.0)
-        # Layer 0 (sensitive) should have more FP16 than layer 1
         assert configs[0].fp16_pct >= configs[1].fp16_pct
 
 
