@@ -90,12 +90,11 @@ class SalienceCache:
 
         self.scorer = ImportanceScorer(num_layers, num_kv_heads, alpha)
 
-        # Per-layer reconstruction + the precision each token's data reflects
         self._keys: dict[int, torch.Tensor] = {}
         self._values: dict[int, torch.Tensor] = {}
         self._key_bits: dict[int, torch.Tensor] = {}   # [seq_len], 16 = exact
         self._val_bits: dict[int, torch.Tensor] = {}
-        # Last tier assignment per side (drives memory accounting)
+        # last assignment, for memory accounting
         self._key_tiers: dict[int, torch.Tensor] = {}
         self._val_tiers: dict[int, torch.Tensor] = {}
         self._overlay_masks: dict[int, torch.Tensor] = {}
@@ -143,12 +142,11 @@ class SalienceCache:
 
         self._seq_len = self._keys[layer_idx].size(2)
 
-        # Update attention-based scores (every step, cheap)
         self.scorer.update_attention(
             layer_idx, attention_weights, self.num_kv_groups
         )
 
-        # Update Key importance with V-deviation (every N steps, moderate cost)
+        # V-deviation rescoring is pricier, so only every N steps
         should_rescore = (self._step % self.rescore_interval == 0)
         if should_rescore and query_states is not None and attention_output is not None:
             self.scorer.update_key_importance(
@@ -157,7 +155,6 @@ class SalienceCache:
                 self.num_kv_groups,
             )
 
-        # After all layers updated, check if we should re-quantize
         if layer_idx == self.num_layers - 1:
             self._step += 1
             if should_rescore:
@@ -179,17 +176,14 @@ class SalienceCache:
         seq_len = keys.size(2)
 
         if seq_len <= self.num_sink_tokens + self.recent_window:
-            # Too short to quantize - keep everything in FP16
             self._is_quantized[layer_idx] = False
             return
 
         device = keys.device
 
-        # Get importance scores
         key_imp = self.scorer.get_key_importance(layer_idx)
         val_imp = self.scorer.get_value_importance(layer_idx)
 
-        # Ensure scores match current seq_len
         if key_imp.size(0) < seq_len:
             pad = torch.zeros(seq_len - key_imp.size(0), device=device)
             key_imp = torch.cat([key_imp, pad])
@@ -200,18 +194,15 @@ class SalienceCache:
         key_imp = key_imp[:seq_len]
         val_imp = val_imp[:seq_len]
 
-        # Protected mask
         protected = get_protected_mask(
             seq_len, self.num_sink_tokens, self.recent_window, device
         )
 
-        # Assign tiers separately for Keys and Values (asymmetric scoring)
         tier_config = self._get_tier_config(layer_idx)
         key_tiers = assign_tiers(key_imp, protected, tier_config)
         val_tiers = assign_tiers(val_imp, protected, tier_config)
 
-        # TurboQuant hardening: rotation/codebook by default off;
-        # legacy outlier-channel overlay only when channel_fraction > 0.
+        # rotation/codebook off by default; overlay only when channel_fraction > 0
         tq = self.turbo_config
         rotation = (
             random_rotation(keys.size(-1), device=device) if tq.rotate else None

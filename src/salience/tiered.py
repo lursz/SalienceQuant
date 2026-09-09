@@ -52,11 +52,11 @@ class TierConfig:
     to stay accurate is to keep the bulk at INT3 and demote only the least
     important tokens to INT2.
     """
-    fp16_pct: float = 0.05   # Top % get FP16 (beyond sinks/recent)
-    int8_pct: float = 0.15   # Next % get INT8
-    int4_pct: float = 0.30   # Next % get INT4
-    int3_pct: float = 0.0    # Next % get INT3 (opt-in; 0 keeps legacy behaviour)
-    # Remaining % get INT2 (implicit)
+    fp16_pct: float = 0.05  # beyond sinks/recent
+    int8_pct: float = 0.15
+    int4_pct: float = 0.30
+    int3_pct: float = 0.0  # opt-in; 0 keeps legacy behaviour
+    # rest is INT2
 
     @property
     def int2_pct(self) -> float:
@@ -140,8 +140,8 @@ class TieredQuantizer:
     ):
         self.group_size = group_size
         self.codebook = codebook
-        self.rotation = rotation  # optional TurboQuant-style rotated-basis quant
-        # Per-tier storage: tier -> (GroupedQuant,) for quantized tiers, (raw,) for FP16
+        self.rotation = rotation  # TurboQuant rotated basis
+        # tier -> (GroupedQuant,), or (raw,) for FP16
         self._key_tiers: dict[Tier, tuple] = {}
         self._value_tiers: dict[Tier, tuple] = {}
         self._key_tier_indices: dict[Tier, torch.Tensor] = {}
@@ -149,9 +149,7 @@ class TieredQuantizer:
         self._seq_len: int = 0
         self._shape: tuple | None = None   # (batch, heads, head_dim)
         self._device: torch.device | None = None
-        # TurboQuant overlay for outlier key channels:
-        #   (mask, source) with overlay_bits=16 (FP16 restore), or
-        #   (mask, GroupedQuant) with overlay_bits<16 (INT storage)
+        # outlier key channels: (mask, source) for FP16 restore, (mask, GroupedQuant) otherwise
         self._key_outlier_overlay: tuple | None = None
         self._key_overlay_bits: int = 16
 
@@ -309,23 +307,19 @@ class TieredQuantizer:
                     continue
                 data = storage[tier]
                 if tier == Tier.FP16:
-                    # FP16: 2 bytes/element (logical FP16 size)
                     tier_bytes += data[0].nelement() * 2
                 else:
-                    # Quantized: GroupedQuant (codes + fp16 scale/zp)
                     side_bytes = data[0].memory_bytes()
                     if side == "key" and overlay is not None:
                         if self._key_overlay_bits >= 16:
-                            # FP16 restore: re-bill overlay elements at 2 bytes
+                            # re-bill overlay elements at 2 bytes
                             mask = overlay[0]
                             batch = self._shape[0]
                             n_tokens = self._key_tier_indices[tier].numel()
                             outlier_elems = batch * n_tokens * int(mask.sum())
                             side_bytes += int(outlier_elems * (2 - TIER_BITS[tier] / 8))
                         else:
-                            # INT overlay replaces those channels entirely; keys
-                            # group along the token axis, so codes AND scales
-                            # shrink proportionally with the dropped channels
+                            # keys group along tokens, so codes and scales both shrink with the dropped channels
                             side_bytes = int(side_bytes * (1 - overlay_channel_frac))
                     tier_bytes += side_bytes
             result[tier.name] = tier_bytes
@@ -384,7 +378,7 @@ def apply_tiered_quant(
     ranked, tier_of = _rank_into_tiers(importance, protected_mask, config)
     result = tensor.clone()
 
-    # FP16 / protected tokens are left untouched; quantize each other tier in place.
+    # protected/FP16 stay as-is
     for tier in Tier:
         if tier == Tier.FP16:
             continue
